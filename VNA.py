@@ -15,9 +15,12 @@
 
 
 
-import scipy, jack, pylab, struct, usb.core, usb.util, traceback, pyfftw, numpy, time
+import scipy, pylab, struct, usb.core, usb.util, traceback, pyfftw, numpy, time
+import jacklib, jacklib_helpers, ctypes, threading
 import cPickle as pickle
-import threading
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
 from Measurement import *
 
 #####
@@ -38,75 +41,102 @@ UBYTE4 = struct.Struct('<L')	# Thanks to Sivan Toledo
 
 
 class VNA:
-  def __init__(self):
+  def __init__(self,fftn=1024,freq=2350.0,amp=1.0,printlevel=1):
     
-    ## State
-    self.sync = True
-    self.threaded = True
-    self.printlevel = 1
-    ## Create output array at 2343.75Hz as this will be centered in a bin for 48000Hz sampling rate
-    ## Need buffer of 25ms RT delay via jack_delay (1200 samples at 48khz) + 21ms (1024 samples for FFT)
-    ## Will create 10 buffers worth (256 buffer size) or 2560 samples
-    self.freq = 2343.75
-    self.fftbin = 50
-    self.fftn = 1024
-    self.rtt = 0.055
-    self.Iamp=1.0
-    self.Qamp=1.0
-    self.Qphase=0.0
-
-
-    jack.attach("vna")
-    jack.register_port("iI", jack.IsInput)
-    jack.register_port("iQ", jack.IsInput)
-    jack.register_port("oI", jack.IsOutput)
-    jack.register_port("oQ", jack.IsOutput)
-    jack.activate()
-    jack.connect("vna:oQ", "system:playback_1")
-    jack.connect("vna:oI", "system:playback_2")
-    jack.connect("system:capture_1", "vna:iQ")
-    jack.connect("system:capture_2", "vna:iI")
+    self.printlevel = printlevel
+    self.amp = amp
+   
+    self.docapture = threading.Event()
+    self.docapture.set()
+    self.startframe = 0
     
-    if self.sync:
-      jack.register_port("iS", jack.IsInput)
-      jack.register_port("oS", jack.IsOutput)      
-      jack.connect("vna:oS", "system:playback_3")
-      jack.connect("system:capture_3", "vna:iS")          
+    self.jackclient = jacklib.client_open("pysdrvna", jacklib.JackNoStartServer | jacklib.JackSessionID, None)
 
-    self.frames = jack.get_buffer_size()
-    self.Sr = float(jack.get_sample_rate())
+    self.iI = jacklib.port_register(self.jackclient,"iI", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsInput, 0)
+    self.iQ = jacklib.port_register(self.jackclient,"iQ", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsInput, 0)    
+
+    self.oI = jacklib.port_register(self.jackclient,"oI", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsOutput, 0)
+    self.oQ = jacklib.port_register(self.jackclient,"oQ", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsOutput, 0)
+   
+    jacklib.set_process_callback(self.jackclient, self.JackProcess, 0)
+
+    jacklib.activate(self.jackclient)
+   
+    jacklib.connect(self.jackclient,"pysdrvna:oQ", "system:playback_1")
+    jacklib.connect(self.jackclient,"pysdrvna:oI", "system:playback_2")    
+    
+    jacklib.connect(self.jackclient,"system:capture_1","pysdrvna:iQ")
+    jacklib.connect(self.jackclient,"system:capture_2","pysdrvna:iI") 
+    
+    self.Sr = float(jacklib.get_sample_rate(self.jackclient))
     self.dt = 1.0/self.Sr
+        
+    self.fftn = fftn
+    ## Set FFT bin and frequency to be around 2.3kHz
+    self.fftbin = int(round((freq/self.Sr)*self.fftn))      
+    self.freq = (float(self.fftbin)/self.fftn) * self.Sr
+    
+    
+    ## Windowing function
+    #self.fftwindow = numpy.blackman(self.fftn)
+    self.fftwindow = None
+      
+    ## Latency settings
+    jlr = jacklib.jack_latency_range_t()
+    jacklib.port_get_latency_range(self.oI,jacklib.JackPlaybackLatency,jlr)
+    self.rtframes = jlr.min
+    jacklib.port_get_latency_range(self.iI,jacklib.JackCaptureLatency,jlr)
+    self.rtframes += jlr.min
+    
+    ## Compute initial array length
+    buffersz = int(jacklib.get_buffer_size(self.jackclient))
+    buffers, remainder = divmod(self.rtframes + self.fftn + 256,buffersz)
+    if remainder > 0: buffers = buffers + 1
 
-    self.rttsamples = int(self.rtt / self.dt)
-    #self.arraylen = ((self.rttsamples + (2*self.fftn) + self.frames) / self.frames) * self.frames
-    self.arraylen = (self.rttsamples / self.frames) * self.frames
-    if (self.rttsamples % self.frames) != 0:
-      self.arraylen = self.arraylen + self.frames
-
-    self.capturei = self.arraylen - (self.fftn + 100)
+    self.synci = self.rtframes
      
-    self.oa = self.ComplexSinusoid(self.freq,self.arraylen)
-    if self.sync:
-      self.ia = scipy.zeros( (3,self.arraylen) ).astype(scipy.float32)      
-    else:
-      self.ia = scipy.zeros( (2,self.arraylen) ).astype(scipy.float32)
+    self.InitJackArrays(self.freq,buffers*buffersz)
     
     self.fftia = pyfftw.n_byte_align_empty(self.fftn, 16, 'complex128')
     self.fftoa = pyfftw.n_byte_align_empty(self.fftn, 16, 'complex128')
-  
     ## Create FFT Plan
     self.fft = pyfftw.FFTW(self.fftia,self.fftoa)
     
-    if self.threaded:
-      self.docapture = threading.Event()
-      self.docapture.set()
-      self.jack_thread = threading.Thread(target=self.JackThread)
-      self.jack_thread.setDaemon(True)
-      self.jack_thread.start()   
+
+  def InitJackArrays(self,freq,samples):
+
+    self.iIa = scipy.zeros(samples).astype(scipy.float32)
+    self.iQa = scipy.zeros(samples).astype(scipy.float32)      
+    
+    self.oIa = scipy.zeros(samples, dtype=scipy.float32 )
+    self.oQa = scipy.zeros(samples, dtype=scipy.float32 )
+    
+    ## 100 frames warmup
+    sf = 0
+    ef = 100
+    samples = scipy.pi + (2*scipy.pi*freq*(self.dt * scipy.r_[sf:ef]))
+    self.oIa[sf:ef] = self.amp * scipy.cos(samples)
+    self.oQa[sf:ef] = self.amp * scipy.sin(samples)
+    
+    # For IQ balancing
+    #self.oIa[sf:ef] = scipy.cos(samples) - (scipy.sin(samples)*(1+self.oalpha)*scipy.sin(self.ophi))
+    #self.oQa[sf:ef] = scipy.sin(samples)*(1+self.oalpha)*scipy.cos(self.ophi)
+    
+    ## 180 phase change then fftn+50 frames
+    sf = ef
+    ef = ef + self.fftn + 50
+    samples = (2*scipy.pi*freq*(self.dt * scipy.r_[sf:ef]))
+    self.oIa[sf:ef] = self.amp * scipy.cos(samples) 
+    self.oQa[sf:ef] = self.amp * scipy.sin(samples)   
+    
+    # For IQ balancing
+    #self.oIa[sf:ef] = scipy.cos(samples) - (scipy.sin(samples)*(1+self.oalpha)*scipy.sin(self.ophi))
+    #self.oQa[sf:ef] = scipy.sin(samples)*(1+self.oalpha)*scipy.cos(self.ophi)    
+    
       
   def Info(self):
-    print "Freq:",self.freq,"FFTbin:",self.fftbin,"FFTn:",self.fftn,"RTT:",self.rtt,"RT Samples:",self.rttsamples
-    print "ArrayLen:",self.arraylen,"CaptureIndex",self.capturei    
+    print "FFT Size:",self.fftn,"FFT Bin:",self.fftbin,"Test Freq:",self.freq
+    print "Array Length:",self.iIa.size,"Sync Index",self.synci   
     
     
   ## SoftRock Control
@@ -127,9 +157,9 @@ class VNA:
         else:
           ver = 'unknown'
         print 'Capture from SoftRock Firmware %s' % ver
-        print ('Startup freq', self.GetStartupFreq())
-        print ('Run freq', self.GetFreq())
-        print ('Address 0x%X' % self.usb_dev.ctrl_transfer(IN, 0x41, 0, 0, 1)[0])
+        print 'Startup freq', self.GetStartupFreq()
+        print 'Run freq', self.GetFreq()
+        print 'Address 0x%X' % self.usb_dev.ctrl_transfer(IN, 0x41, 0, 0, 1)[0]
         sm = self.usb_dev.ctrl_transfer(IN, 0x3B, 0, 0, 2)
         sm = UBYTE2.unpack(sm)[0]
         print 'Smooth tune', sm
@@ -168,33 +198,47 @@ class VNA:
       except usb.core.USBError:
         traceback.print_exc()
     
-  def __del__(self):
-    jack.deactivate()
-    jack.detach()
-    
+
   def Quit(self):
-    jack.deactivate()
-    jack.detach()  
- 
-  def ComplexSinusoid(self,freq,samples,sst=0):
-    sampling_times = self.dt * scipy.r_[sst:sst+samples]
-    I = self.Iamp * scipy.cos( (2*scipy.pi*freq*sampling_times))
-    ## Change sign of Qamp if needed
-    Q = self.Qamp * scipy.sin( (2*scipy.pi*freq*sampling_times) + (2*scipy.pi*(self.Qphase/360.0)))
-    #Q = Qamp * scipy.sin( (4*scipy.pi*freq*sampling_times) + (2*scipy.pi*(Qphase/360.0)))
-    if self.sync:
-      S = scipy.zeros( (len(sampling_times),), dtype=scipy.float32 )
-      ## Apply first signal
-      f = 1.0/(16*self.dt)
-      syncsts = self.dt * scipy.r_[0:17]
-      S[50:67] = scipy.sin(2*scipy.pi*f*syncsts)
-      S[100+self.fftn:117+self.fftn] = scipy.sin(2*scipy.pi*f*syncsts)
-      return scipy.array( [I.astype(scipy.float32),Q.astype(scipy.float32),S] )
-    else:
-      return scipy.array( [I.astype(scipy.float32),Q.astype(scipy.float32)] )
-  
+    try:
+      jacklib.deactivate(self.jackclient)
+    except:
+      pass
+    try:
+      jacklib.client_close(self.jackclient)
+    except:
+      pass
+    
+
+  def Sync(self):
+    
+    ## Find start by amplitude
+    mv = 0.7 * self.iIa[self.rtframes:].max()
+    sia = numpy.nonzero( self.iIa[self.rtframes:] > mv )[0]
+    si = sia[0] + self.rtframes
+    
+    ## Phase change is after 100 frames, add a bit of a buffer
+    synca = self.iIa[si:si+120] - 1j * self.iQa[si:si+120]    
+    anglea = numpy.angle(synca,deg=True) + 180
+    deltaaa = (anglea[1:] - anglea[:-1]) % 360
+    
+    ## Buffer FFT start window to 20 frames past phase change
+    syncindex = (numpy.nonzero( (deltaaa > 90) & (deltaaa < 270) )[0][0]) + si + 20 
+    
+    self.synci = syncindex
+    
+    
   def DoFFT(self):
-    self.fftia[:] = self.ia[0,self.capturei:self.capturei+self.fftn] - 1j * self.ia[1,self.capturei:self.capturei+self.fftn]
+    
+    ## Remove DC bias
+    I = self.iIa[self.synci:self.synci+self.fftn]
+    #I = I - numpy.mean(I)
+    Q = self.iQa[self.synci:self.synci+self.fftn]
+    #Q = Q - numpy.mean(Q)
+    
+    self.fftia[:] = I - 1j * Q
+    if self.fftwindow != None: self.fftia[:] = self.fftwindow * self.fftia
+    
     self.fft()
 
   def Test(self,iterations=10,sleep=None):
@@ -208,102 +252,34 @@ class VNA:
       if sleep:
         time.sleep(sleep)      
 
-  def TestTone(self,j=2000):
-    sst = 0
-    ia = scipy.zeros( (2,self.frames) ).astype(scipy.float32)    
-    self.PTT(1)
-    while j >= 0:
-      oa = self.ComplexSinusoid(self.freq,self.frames,sst=sst)
-      try:
-        jack.process(oa,ia)
-      except jack.InputSyncError:
-        if sst != 0:
-          print "InputSyncError"
-      except jack.OutputSyncError:
-        print "OutputSyncError"
-      sst += self.frames
-      j = j - 1
-    self.PTT(0)
-    
-    
-    
-  def JackThread(self):
-    
-    if self.sync:
-      chs = 3
-    else:
-      chs = 2
+  
+  def JackProcess(self,nframes,arg):
+    if not self.docapture.is_set():
       
-    dia = scipy.zeros( (chs,self.frames) ).astype(scipy.float32)
-    doa = scipy.zeros( (chs,self.frames) ).astype(scipy.float32)
+      ## Copy input data
+      endframe = self.startframe + nframes
+      if endframe > self.iIa.size:
+        endframe = self.iIa.size
+        
+      tsz = (endframe-self.startframe) * ctypes.sizeof(jacklib.jack_default_audio_sample_t)
+      basei = self.startframe * ctypes.sizeof(jacklib.jack_default_audio_sample_t)
     
- 
-    while self.threaded:
-      
-      if not self.docapture.is_set():
-        self.JackProcess()
-        self.docapture.set()
-      else:
-        ## Service jack with default input and output
-        try:
-          jack.process(doa,dia)
-          time.sleep(0.003)
-        except jack.InputSyncError:
-          if self.printlevel > 1:
-            print "InputSyncError during default"
-          pass
-        except jack.OutputSyncError:
-          if self.printlevel > 1:
-            print "OutputSyncError during default"
-          pass    
+      ctypes.memmove(self.iIa.ctypes.data+basei,jacklib.port_get_buffer(self.iI,nframes),tsz)
+      ctypes.memmove(self.iQa.ctypes.data+basei,jacklib.port_get_buffer(self.iQ,nframes),tsz) 
+      ctypes.memmove(jacklib.port_get_buffer(self.oI,nframes),self.oIa.ctypes.data+basei,tsz)
+      ctypes.memmove(jacklib.port_get_buffer(self.oQ,nframes),self.oQa.ctypes.data+basei,tsz)
+      #print self.startframe,endframe,basei,tsz
 
-
-  def JackProcess(self):
+      self.startframe = endframe
+      if self.startframe >= self.iIa.size:
+        self.docapture.set() 
+              
+    return 0
     
-    done = False
-    while not done:
-      done = True 
-      i = 0
-      while i <= self.oa.shape[1] - self.frames:
-        try:
-          jack.process(self.oa[:,i:i+self.frames], self.ia[:,i:i+self.frames])
-          i += self.frames
-        except jack.InputSyncError:
-          ## Always expect an input sync error when first calling jack process
-          if i != 0:
-            if self.printlevel > 0: print "InputSyncError",i
-            done = False
-            break
-          elif self.printlevel > 2:
-            print "InputSyncError",i
-            
-        except jack.OutputSyncError:
-          if self.printlevel > 0: print "OutputSyncError",i
-          done = False
-          break
-          
-      ## Test for proper sync
-      if self.sync:
-        ## FIXME: Problems if sample is just at edge
-        sa = numpy.where( self.ia[2] > 0.2 )
-        lsa = len(sa[0])
-        if lsa % 2 != 0:
-          if self.printlevel > 0: print "Uneven sync array",sa
-          done = False
-        else:
-          fi = sa[0][0]
-          si = sa[0][lsa/2]
-          if ((si - fi) - 50) != self.fftn:
-            if self.printlevel > 0: print "Incorrect number of samples between sync signals",fi,si
-            done = False
-          else:
-            self.capturei = fi   
-            
   def Mprint(self,isdut=False):
 
     if self.printlevel > 0:
-      if self.sync:
-        print "Sync:%d" % self.capturei,
+      print "Sync:%d" % self.synci,
       print "Freq:%d" % int(round(self.GetFreq()+self.freq)),
       cn = self.fftoa[self.fftbin]
       print "Real:%3.1f" % cn.real,
@@ -317,13 +293,12 @@ class VNA:
     
     self.PTT(1) 
     
-    if self.threaded:
-      self.docapture.clear()
-      self.docapture.wait()
-    else:
-      self.JackProcess()
+    self.startframe = 0
+    self.docapture.clear()
+    self.docapture.wait()
 
     self.PTT(0)
+    self.Sync()
     self.DoFFT()
     
   def M2Array(self,freq,array):
@@ -361,19 +336,32 @@ class VNA:
       m.PrintSWR()
  
   def PlotTD(self):
-    pylab.plot(range(0,len(self.oa[0])),self.oa[0],'-o')
-    pylab.plot(range(0,len(self.ia[0])),self.ia[0],'-o')
-    pylab.show()
+    fig = self.CreateFigure("Time Domain")
+    sp = fig.add_subplot(111)
+    xaxis = range(0,len(self.iIa))
+    sp.plot(xaxis,self.iIa,'.-',color='b',label='iI')
+    sp.plot(xaxis,self.iQa,'.-',color='r',label='iQ')
+    sp.plot(xaxis,self.oIa,'.-',color='c',label='oI')
+    sp.plot(xaxis,self.oQa,'.-',color='m',label='oQ')    
+    sp.set_ylabel("Amplitude")
+    sp.set_xlabel("Sample")
+    #sp.legend(bbox_to_anchor=(1,-0.1))  
+    sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=4)   
+    plt.show()        
     
-  def PlotSync(self):
-    pylab.plot(range(0,len(self.oa[2])),self.oa[2],'-o')
-    pylab.plot(range(0,len(self.ia[2])),self.ia[2],'-o')
-    pylab.show()
-    
-  def PlotFFTWindow(self):
-    pylab.plot(range(0,self.fftn),self.ia[0,self.capturei:self.capturei+self.fftn])
-    pylab.plot(range(0,self.fftn),self.ia[1,self.capturei:self.capturei+self.fftn])
-    pylab.show()
+ 
+  
+  def PlotFFTInput(self):
+    fig = self.CreateFigure("FFT Input")
+    sp = fig.add_subplot(111)
+    xaxis = range(0,self.fftn)
+    sp.plot(xaxis,[x.real for x in self.fftia],'.-',color='b',label='I')
+    sp.plot(xaxis,[x.imag for x in self.fftia],'.-',color='r',label='Q')    
+    sp.set_ylabel("Amplitude")
+    sp.set_xlabel("Sample")
+    #sp.legend(bbox_to_anchor=(1,-0.1))  
+    sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=4)   
+    plt.show()    
     
 
   def PlotFD(self,dbfs=True):
@@ -382,14 +370,27 @@ class VNA:
     if dbfs:
       zerodb = 20*numpy.log10(self.fftn/2)
       freqspectrum = (20*numpy.log10(abs(freqspectrum))) - zerodb
-    pylab.plot(range(0,len(freqspectrum)),freqspectrum,'-o')
-    pylab.show()
+      
+    fig = self.CreateFigure("Frequency Domain")
+    sp = fig.add_subplot(111)
+    xaxis = numpy.linspace(-self.Sr/2,self.Sr/2,self.fftn)
+    sp.plot(xaxis,freqspectrum,'.-',color='k',label='Spectrum')
+    sp.set_ylabel("Amplitude")
+    sp.set_xlabel("Frequency")
+    sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=4)   
+    plt.show()          
+      
     
+  def CreateFigure(self,title):
+    fig = plt.figure()
+    fig.subplots_adjust(bottom=0.2)
+    fig.suptitle(title, fontsize=20)
+    return fig    
     
     
     
 if __name__ == '__main__':
-  a = VNA()
+  a = VNA(fftn=1024,freq=3000.0)
   a.OpenSoftRock()
   a.Info()
 
