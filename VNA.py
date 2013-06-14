@@ -15,8 +15,8 @@
 
 
 
-import scipy, pylab, struct, usb.core, usb.util, traceback, pyfftw, numpy, time
-import jacklib, jacklib_helpers, ctypes, threading
+import scipy, struct, usb.core, usb.util, traceback, pyfftw, numpy, time
+import jacklib, ctypes, threading, getopt, sys, os
 import cPickle as pickle
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -42,6 +42,7 @@ UBYTE4 = struct.Struct('<L')	# Thanks to Sivan Toledo
 
 class VNA:
   def __init__(self,fftn=1024,freq=2350.0,amp=1.0,printlevel=1):
+    """Create a VNA object"""
     
     self.printlevel = printlevel
     self.amp = amp
@@ -72,22 +73,29 @@ class VNA:
     self.dt = 1.0/self.Sr
         
     self.fftn = fftn
-    ## Set FFT bin and frequency to be around 2.3kHz
+    ## Align frequency to nearest bin
     self.fftbin = int(round((freq/self.Sr)*self.fftn))      
     self.freq = (float(self.fftbin)/self.fftn) * self.Sr
     
-    
     ## Windowing function
     #self.fftwindow = numpy.blackman(self.fftn)
-    self.fftwindow = None
+    self.fftwindow = numpy.hanning(self.fftn)
+    #self.fftwindow = numpy.kaiser(self.fftn,14)
+    #self.fftwindow = numpy.hamming(self.fftn)
+    #self.fftwindow = numpy.bartlett(self.fftn)
+    #self.fftwindow = None
       
     ## Latency settings
-    jlr = jacklib.jack_latency_range_t()
-    jacklib.port_get_latency_range(self.oI,jacklib.JackPlaybackLatency,jlr)
-    self.rtframes = jlr.min
-    jacklib.port_get_latency_range(self.iI,jacklib.JackCaptureLatency,jlr)
-    self.rtframes += jlr.min
-    
+    #jlr = jacklib.jack_latency_range_t()
+    #jacklib.port_get_latency_range(self.oI,jacklib.JackPlaybackLatency,jlr)
+    #self.rtframes = jlr.min
+    #jacklib.port_get_latency_range(self.iI,jacklib.JackCaptureLatency,jlr)
+    #self.rtframes += jlr.min
+ 
+    # The above code does not always work
+    # Got estimate is 3 times the buffer size
+    self.rtframes = 3 * jacklib.get_buffer_size(self.jackclient)
+
     ## Compute initial array length
     buffersz = int(jacklib.get_buffer_size(self.jackclient))
     buffers, remainder = divmod(self.rtframes + self.fftn + 256,buffersz)
@@ -104,6 +112,7 @@ class VNA:
     
 
   def InitJackArrays(self,freq,samples):
+    """Initialize Jack Arrays"""
 
     self.iIa = scipy.zeros(samples).astype(scipy.float32)
     self.iQa = scipy.zeros(samples).astype(scipy.float32)      
@@ -135,12 +144,14 @@ class VNA:
     
       
   def Info(self):
-    print "FFT Size:",self.fftn,"FFT Bin:",self.fftbin,"Test Freq:",self.freq
+    """Print Information"""
+    print "FFT Size:",self.fftn,"FFT Bin:",self.fftbin,"Test Freq:",self.freq,
     print "Array Length:",self.iIa.size,"Sync Index",self.synci   
     
     
   ## SoftRock Control
   def OpenSoftRock(self):
+    """Open the SoftRock"""
     ## Open SoftRock
     # find our device
     self.usb_vendor_id = 0x16c0
@@ -168,6 +179,7 @@ class VNA:
         self.usb_dev = None
 
   def GetStartupFreq(self):	# return the startup frequency / 4
+    """Return the SoftRock Startup Frequency"""
     if not self.usb_dev: return 0
     ret = self.usb_dev.ctrl_transfer(IN, 0x3C, 0, 0, 4)
     s = ret.tostring()
@@ -176,6 +188,7 @@ class VNA:
     return freq
     
   def GetFreq(self):	# return the running frequency / 4
+    """Return the SoftRock Running Frequency"""
     if not self.usb_dev: return 0
     ret = self.usb_dev.ctrl_transfer(IN, 0x3A, 0, 0, 4)
     s = ret.tostring()
@@ -184,6 +197,7 @@ class VNA:
     return freq    
     
   def SetFreq(self, freq):
+    """Set the SoftRock Running Frequency"""
     freq = int(freq/1.0e6 * 2097152.0 * 4.0 + 0.5)
     s = UBYTE4.pack(freq)
     try:
@@ -200,6 +214,7 @@ class VNA:
     
 
   def Quit(self):
+    """Exit Cleanly from Interactive VNA"""
     try:
       jacklib.deactivate(self.jackclient)
     except:
@@ -208,10 +223,11 @@ class VNA:
       jacklib.client_close(self.jackclient)
     except:
       pass
+    quit()
     
 
   def Sync(self):
-    
+    """Locate the Sync Phase Shift"""
     ## Find start by amplitude
     mv = 0.7 * self.iIa[self.rtframes:].max()
     sia = numpy.nonzero( self.iIa[self.rtframes:] > mv )[0]
@@ -227,9 +243,12 @@ class VNA:
     
     self.synci = syncindex
     
+    if self.iIa.size < (self.synci + self.fftn):
+      raise IndexError("Jack buffer is not long enough and/or bad sync")
+    
     
   def DoFFT(self):
-    
+    """Calculate the FFT"""
     ## Remove DC bias
     I = self.iIa[self.synci:self.synci+self.fftn]
     #I = I - numpy.mean(I)
@@ -241,12 +260,11 @@ class VNA:
     
     self.fft()
 
-  def Test(self,iterations=10,sleep=None):
-    
-    print "Beginning Test",iterations,sleep
+  def Test(self,iterations=1,sleep=None):
+    """Execute a Test Measurement for Specified Iterations"""
     
     for i in range(0,iterations):
-      print "Test iteration",i
+      print i,
       self.M()
       self.Mprint()
       if sleep:
@@ -254,6 +272,7 @@ class VNA:
 
   
   def JackProcess(self,nframes,arg):
+    """Main Jack Process Method"""
     if not self.docapture.is_set():
       
       ## Copy input data
@@ -277,7 +296,7 @@ class VNA:
     return 0
     
   def Mprint(self,isdut=False):
-
+    """Print Information for a Measurement"""
     if self.printlevel > 0:
       print "Sync:%d" % self.synci,
       print "Freq:%d" % int(round(self.GetFreq()+self.freq)),
@@ -287,8 +306,10 @@ class VNA:
       print "Mag:%3.1f" % numpy.abs(cn),
       print "Phase:%3.1f" % numpy.angle(cn,deg=True)
       
+      #print "Bins",numpy.abs(self.fftoa[self.fftbin-1]),numpy.abs(self.fftoa[self.fftbin]),numpy.abs(self.fftoa[self.fftbin+1])
+      
   def M(self,freq=None):
-    
+    """Main Measurement Method"""
     if freq: self.SetFreq(freq-self.freq)
     
     self.PTT(1) 
@@ -302,6 +323,7 @@ class VNA:
     self.DoFFT()
     
   def M2Array(self,freq,array):
+    """Array of Main Measurements Method"""
     i = 0
     for f in freq:
       self.M(int(f*1000000))
@@ -310,22 +332,27 @@ class VNA:
       i += 1    
 
   def MO(self,m):
+    """Measure Open Standard"""
     print "Beginning Open Measurements"
     self.M2Array(m.freq,m.open)
     
   def MS(self,m):
+    """Measure Short Standard"""
     print "Beginning Short Measurements"
     self.M2Array(m.freq,m.short)
     
   def ML(self,m):
+    """Measure Load Standard"""
     print "Beginning Load Measurements"
     self.M2Array(m.freq,m.load)
 
   def MD(self,m):
+    """Measure DUT"""
     print "Beginning DUT Measurements"
     self.M2Array(m.freq,m.dut)
     
   def SWR(self,m,iterations=100):
+    """Make Iteration Number of SWR Measurements at Current Frequency"""
     if m.freq.size != 1:
       raise IndexError("SWR requires exactly 1 measurement")
     print "Beginning SWR Measurements"
@@ -336,14 +363,16 @@ class VNA:
       m.PrintSWR()
  
   def PlotTD(self):
+    """Plot Time Domain of Jack Input and Output Arrays for Last Measurement"""
     fig = self.CreateFigure("Time Domain")
     sp = fig.add_subplot(111)
     xaxis = range(0,len(self.iIa))
     sp.plot(xaxis,self.iIa,'.-',color='b',label='iI')
-    sp.plot(xaxis,self.iQa,'.-',color='r',label='iQ')
+    ## 180 phase shift as complex portion is created with -1j
+    sp.plot(xaxis,-1*self.iQa,'.-',color='r',label='iQ')
     sp.plot(xaxis,self.oIa,'.-',color='c',label='oI')
     sp.plot(xaxis,self.oQa,'.-',color='m',label='oQ')    
-    sp.set_ylabel("Amplitude")
+    sp.set_ylabel("Magnitude")
     sp.set_xlabel("Sample")
     #sp.legend(bbox_to_anchor=(1,-0.1))  
     sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=4)   
@@ -352,12 +381,13 @@ class VNA:
  
   
   def PlotFFTInput(self):
+    """Plot Time Domain of FFT Input Slice for Last Measurement"""
     fig = self.CreateFigure("FFT Input")
     sp = fig.add_subplot(111)
     xaxis = range(0,self.fftn)
     sp.plot(xaxis,[x.real for x in self.fftia],'.-',color='b',label='I')
     sp.plot(xaxis,[x.imag for x in self.fftia],'.-',color='r',label='Q')    
-    sp.set_ylabel("Amplitude")
+    sp.set_ylabel("Magnitude")
     sp.set_xlabel("Sample")
     #sp.legend(bbox_to_anchor=(1,-0.1))  
     sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=4)   
@@ -365,6 +395,7 @@ class VNA:
     
 
   def PlotFD(self,dbfs=True):
+    """Plot Frequency Domain for Last Measurement"""
     freqspectrum = numpy.abs(self.fftoa)
     freqspectrum = numpy.concatenate( [freqspectrum[self.fftn/2:self.fftn],freqspectrum[0:self.fftn/2]] )
     if dbfs:
@@ -373,9 +404,11 @@ class VNA:
       
     fig = self.CreateFigure("Frequency Domain")
     sp = fig.add_subplot(111)
-    xaxis = numpy.linspace(-self.Sr/2,self.Sr/2,self.fftn)
-    sp.plot(xaxis,freqspectrum,'.-',color='k',label='Spectrum')
-    sp.set_ylabel("Amplitude")
+    
+    xaxis = numpy.r_[0:self.fftn] * (self.Sr/self.fftn)
+    xaxis = numpy.concatenate( [(xaxis[self.fftn/2:self.fftn] - self.Sr),xaxis[0:self.fftn/2]])
+    sp.plot(xaxis,freqspectrum,'.-',color='b',label='Spectrum')
+    sp.set_ylabel("dBFS")
     sp.set_xlabel("Frequency")
     sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=4)   
     plt.show()          
@@ -387,10 +420,36 @@ class VNA:
     fig.suptitle(title, fontsize=20)
     return fig    
     
-    
+
     
 if __name__ == '__main__':
-  a = VNA(fftn=1024,freq=3000.0)
-  a.OpenSoftRock()
-  a.Info()
+  
+  ## Edit defaults here
+  fftn = 1024
+  freq = 2350.0
+  amp = 1.0
+  
+  try:
+    opts, args = getopt.getopt(sys.argv[1:],"hn:f:a:",["fftn=","testtonefreq=","testtoneamp="])
+  except getopt.GetoptError:
+    print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude>'
+    os._exit(2)
+
+  for opt, arg in opts:
+    if opt == '-h':
+      print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude>'
+      os._exit(0)
+    elif opt in ('-n','--fftn'):
+      fftn = int(arg)
+    elif opt in ('-f','--testtonefreq'):
+      freq = float(arg)
+    elif opt in ('-f','--testtoneamp'):
+      amp = float(arg)
+      
+  vna = VNA(fftn,freq,amp)
+  vna.OpenSoftRock()
+  vna.Info()
+  
+  print "vna is the VNA object. Type help(vna) for more information. Use vna.Quit() to exit cleanly."
+  
 

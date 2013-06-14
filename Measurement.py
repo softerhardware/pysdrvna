@@ -29,6 +29,7 @@ def LoadMeasurement(fn):
 class Measurement:
   
   def __init__(self,fstart,fstop=None,fstep=0.1,eloadz=60+0j,feedlinez=50+0j,view=False):
+    """Create a Measurement Object"""
 
     ## Do not init anything if creating a view
     if view: return
@@ -121,6 +122,7 @@ class Measurement:
     return nms
     
   def Copy(self):
+    """Copy a Measurement Object"""
     nms = Measurement(0,view=True)
     nms.freq = np.copy(self.freq)
     nms.open = np.copy(self.open)
@@ -133,22 +135,22 @@ class Measurement:
     
  
   def Z(self):
-    """ Compute Complex Impedance """
+    """Compute Complex Impedance"""
     return (self.eloadz * (self.open-self.load) * (self.dut-self.short)) / ((self.load-self.short) * (self.open-self.dut))
     
   def Rho(self,z=None):
-    """ Compute Reflection Coefficient """
+    """Compute Reflection Coefficient"""
     if not z: z = self.Z()
     return (z - self.feedlinez)/(z + self.feedlinez)
 
   def SWR(self,rho=None):
-    """ Compute SWR """
+    """Compute SWR"""
     if not rho: rho = self.Rho()
     rho = np.abs(rho)
     return (1+rho)/(1-rho)
     
   def RL(self,rho=None):
-    """ Compute Return Loss """
+    """Compute Return Loss"""
     if not rho: rho = self.Rho()
     rho = np.abs(rho)
     return (-20 * np.log10(rho))
@@ -178,6 +180,7 @@ class Measurement:
       print
       
   def PrintSWR(self):
+    """Print SWR"""
     strs = self.Strs(SWR=True)
     for s in strs:
       for i in s: print i,
@@ -185,6 +188,7 @@ class Measurement:
       
       
   def PlotRho(self):
+    """Plot Rho"""
     fig = self.CreateFigure("Rho vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotComplex(sp,self.Rho())
@@ -192,6 +196,7 @@ class Measurement:
     plt.show()    
     
   def PlotOpen(self):
+    """Plot Open Standard"""
     fig = self.CreateFigure("Open vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotComplex(sp,self.open)
@@ -199,6 +204,7 @@ class Measurement:
     plt.show()        
     
   def PlotLoad(self):
+    """Plot Load Standard"""
     fig = self.CreateFigure("Load vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotComplex(sp,self.load)
@@ -206,6 +212,7 @@ class Measurement:
     plt.show()        
 
   def PlotDUT(self):
+    """Plot DUT"""
     fig = self.CreateFigure("DUT vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotComplex(sp,self.dut)
@@ -214,6 +221,7 @@ class Measurement:
 
 
   def PlotZ(self,absxc=True):
+    """Plot DUT Z vs Frequency"""
     fig = self.CreateFigure("DUT Z vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotImpedance(sp,self.Z(),absxc)
@@ -221,6 +229,7 @@ class Measurement:
     plt.show()        
     
   def PlotELoadZ(self,absxc=True):
+    """Plot Expected Load Z vs Frequency"""
     fig = self.CreateFigure("Expected Load Z vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotImpedance(sp,self.eloadz,absxc)
@@ -228,6 +237,7 @@ class Measurement:
     plt.show()       
     
   def PlotFeedLineZ(self,absxc=True):
+    """Plot Feedline Z vs Frequency"""
     fig = self.CreateFigure("Line Z vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotImpedance(sp,self.feedlinez,absxc)
@@ -235,6 +245,7 @@ class Measurement:
     plt.show()       
     
   def PlotSWR(self):
+    """Plot SWR"""
     fig = self.CreateFigure("SWR vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotSWR(sp)
@@ -242,6 +253,7 @@ class Measurement:
     plt.show()        
     
   def PlotRL(self):
+    """Plot Return Loss vs Frequency"""
     fig = self.CreateFigure("Return Loss vs Frequency")
     sp = fig.add_subplot(111)
     self.SubPlotRL(sp)
@@ -328,6 +340,7 @@ class Measurement:
     sp.legend(bbox_to_anchor=(1,-0.1))    
  
   def SaveLinSmith(self,fn):
+    """Export LinSmith File"""
     linsmithf = open(fn+".load", 'w')
     linsmithf.write('<?xml version="1.0"?>\n')
     linsmithf.write("<loads>\n")
@@ -340,6 +353,7 @@ class Measurement:
 
 
   def SaveMeasurement(self,fn):
+    """Save Measurement Object"""
     pkl_file = open(fn+".vam", 'wb')    
     pickle.dump( self, pkl_file )
     pkl_file.close()
