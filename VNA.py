@@ -14,6 +14,17 @@
 # GNU General Public License at <http://www.gnu.org/licenses/> for details.
 
 
+##############################################
+## Edit defaults here
+fftn = 1024
+freq = 2350.0
+amp = 1.0
+inI = "system:capture_2"
+inQ = "system:capture_1"
+outI = "system:playback_2"
+outQ = "system:playback_1"
+##############################################
+
 
 import scipy, struct, usb.core, usb.util, traceback, pyfftw, numpy, time
 import jacklib, ctypes, threading, getopt, sys, os
@@ -39,9 +50,20 @@ OUT = usb.util.build_request_type(usb.util.CTRL_OUT, usb.util.CTRL_TYPE_VENDOR, 
 UBYTE2 = struct.Struct('<H')
 UBYTE4 = struct.Struct('<L')	# Thanks to Sivan Toledo
 
+## To supress annoying Jack error messages if script starts jackd
+def RedirectStderr():
+    sys.stderr.flush()
+    newstderr = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    sys.stderr = os.fdopen(newstderr, 'w')  
+
 
 class VNA:
-  def __init__(self,fftn=1024,freq=2350.0,amp=1.0,printlevel=1):
+  def __init__(self,fftn=1024,freq=2350.0,amp=1.0,inI="system:capture_2",
+    inQ="system:capture_1",outI="system:playback_2",outQ="system:playback_1",
+    printlevel=1):
     """Create a VNA object"""
     
     self.printlevel = printlevel
@@ -50,8 +72,15 @@ class VNA:
     self.docapture = threading.Event()
     self.docapture.set()
     self.startframe = 0
+
+    #self.jackclient = jacklib.client_open("pysdrvna", jacklib.JackNoStartServer | jacklib.JackSessionID, None)
+    self.jackclient = jacklib.client_open("pysdrvna", jacklib.JackSessionID, None)
     
-    self.jackclient = jacklib.client_open("pysdrvna", jacklib.JackNoStartServer | jacklib.JackSessionID, None)
+    try:
+      self.jackclient.contents
+    except:
+      print "Problems with Jack"
+      raise
 
     self.iI = jacklib.port_register(self.jackclient,"iI", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsInput, 0)
     self.iQ = jacklib.port_register(self.jackclient,"iQ", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsInput, 0)    
@@ -63,11 +92,11 @@ class VNA:
 
     jacklib.activate(self.jackclient)
    
-    jacklib.connect(self.jackclient,"pysdrvna:oQ", "system:playback_1")
-    jacklib.connect(self.jackclient,"pysdrvna:oI", "system:playback_2")    
+    jacklib.connect(self.jackclient,"pysdrvna:oQ", outQ)
+    jacklib.connect(self.jackclient,"pysdrvna:oI", outI)    
     
-    jacklib.connect(self.jackclient,"system:capture_1","pysdrvna:iQ")
-    jacklib.connect(self.jackclient,"system:capture_2","pysdrvna:iI") 
+    jacklib.connect(self.jackclient,inQ,"pysdrvna:iQ")
+    jacklib.connect(self.jackclient,inI,"pysdrvna:iI") 
     
     self.Sr = float(jacklib.get_sample_rate(self.jackclient))
     self.dt = 1.0/self.Sr
@@ -93,27 +122,24 @@ class VNA:
     #self.rtframes += jlr.min
  
     # The above code does not always work
-    # Got estimate is 3 times the buffer size
-    self.rtframes = 3 * jacklib.get_buffer_size(self.jackclient)
-
+    # Reasonable estimate is 3 times the buffer size
     ## Compute initial array length
-    buffersz = int(jacklib.get_buffer_size(self.jackclient))
-    buffers, remainder = divmod(self.rtframes + self.fftn + 256,buffersz)
+    self.buffersz = int(jacklib.get_buffer_size(self.jackclient))
+    self.rtframes = 3 * self.buffersz
+    buffers, remainder = divmod(self.rtframes + self.fftn + 256,self.buffersz)
     if remainder > 0: buffers = buffers + 1
 
     self.synci = self.rtframes
      
-    self.InitJackArrays(self.freq,buffers*buffersz)
+    self.InitJackArrays(self.freq,buffers*self.buffersz)
     
     self.fftia = pyfftw.n_byte_align_empty(self.fftn, 16, 'complex128')
     self.fftoa = pyfftw.n_byte_align_empty(self.fftn, 16, 'complex128')
     ## Create FFT Plan
     self.fft = pyfftw.FFTW(self.fftia,self.fftoa)
-    
 
   def InitJackArrays(self,freq,samples):
     """Initialize Jack Arrays"""
-
     self.iIa = scipy.zeros(samples).astype(scipy.float32)
     self.iQa = scipy.zeros(samples).astype(scipy.float32)      
     
@@ -142,7 +168,26 @@ class VNA:
     #self.oIa[sf:ef] = scipy.cos(samples) - (scipy.sin(samples)*(1+self.oalpha)*scipy.sin(self.ophi))
     #self.oQa[sf:ef] = scipy.sin(samples)*(1+self.oalpha)*scipy.cos(self.ophi)    
     
+  def TrimArrays(self):
+    """Trim Jack Arrays"""
+    ## Use last sync index
+    if self.synci == self.rtframes:
+      raise IndexError("Sync Index appears uninitialized")
       
+    samples = self.synci + self.fftn + 20
+    buffers, remainder = divmod(self.synci + self.fftn + 20,self.buffersz)
+    if remainder > 0: buffers = buffers + 1
+    
+    print "Array length was",self.iIa.size,
+    self.InitJackArrays(self.freq,buffers*self.buffersz)
+    print "now",self.iIa.size
+    
+  def NewAmp(self,amp):
+    """Regenerate Test Tone with New Amplitude"""
+    print "Amplitude was",self.amp,"now",amp
+    self.amp = amp
+    self.InitJackArrays(self.freq,self.iIa.size)
+
   def Info(self):
     """Print Information"""
     print "FFT Size:",self.fftn,"FFT Bin:",self.fftbin,"Test Freq:",self.freq,
@@ -423,30 +468,37 @@ class VNA:
 
     
 if __name__ == '__main__':
-  
-  ## Edit defaults here
-  fftn = 1024
-  freq = 2350.0
-  amp = 1.0
-  
+    
+  def PrintUsage():
+    print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude> -i <inI> -q <inQ> -I <outI> -Q <outQ>'
+   
   try:
-    opts, args = getopt.getopt(sys.argv[1:],"hn:f:a:",["fftn=","testtonefreq=","testtoneamp="])
+    opts, args = getopt.getopt(sys.argv[1:],"hn:f:a:i:q:I:Q:",[])
   except getopt.GetoptError:
-    print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude>'
+    PrintUsage()
     os._exit(2)
 
   for opt, arg in opts:
     if opt == '-h':
-      print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude>'
+      PrintUsage()
       os._exit(0)
-    elif opt in ('-n','--fftn'):
+    elif opt == '-n':
       fftn = int(arg)
-    elif opt in ('-f','--testtonefreq'):
+    elif opt == '-f':
       freq = float(arg)
-    elif opt in ('-f','--testtoneamp'):
+    elif opt == '-a':
       amp = float(arg)
-      
-  vna = VNA(fftn,freq,amp)
+    elif opt == '-i':
+      inI = arg
+    elif opt == '-q':
+      inQ = arg    
+    elif opt == '-I':
+      outI = arg    
+    elif opt == '-Q':
+      outQ = arg
+  
+  RedirectStderr()
+  vna = VNA(fftn,freq,amp,inI,inQ,outI,outQ)
   vna.OpenSoftRock()
   vna.Info()
   
