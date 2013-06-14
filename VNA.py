@@ -13,19 +13,6 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License at <http://www.gnu.org/licenses/> for details.
 
-
-##############################################
-## Edit defaults here
-fftn = 1024
-freq = 2350.0
-amp = 1.0
-inI = "system:capture_2"
-inQ = "system:capture_1"
-outI = "system:playback_2"
-outQ = "system:playback_1"
-##############################################
-
-
 import scipy, struct, usb.core, usb.util, traceback, pyfftw, numpy, time
 import jacklib, ctypes, threading, getopt, sys, os
 import cPickle as pickle
@@ -33,6 +20,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 
 from Measurement import *
+from config import *
 
 #####
 ## All si570 interface code is borrow directly from or based on QUISK. Thank you!
@@ -48,7 +36,7 @@ IN =  usb.util.build_request_type(usb.util.CTRL_IN,  usb.util.CTRL_TYPE_VENDOR, 
 OUT = usb.util.build_request_type(usb.util.CTRL_OUT, usb.util.CTRL_TYPE_VENDOR, usb.util.CTRL_RECIPIENT_DEVICE)
 
 UBYTE2 = struct.Struct('<H')
-UBYTE4 = struct.Struct('<L')	# Thanks to Sivan Toledo
+UBYTE4 = struct.Struct('<L')    # Thanks to Sivan Toledo
 
 ## To supress annoying Jack error messages if script starts jackd
 def RedirectStderr():
@@ -61,8 +49,9 @@ def RedirectStderr():
 
 
 class VNA:
-  def __init__(self,fftn=1024,freq=2350.0,amp=1.0,inI="system:capture_2",
-    inQ="system:capture_1",outI="system:playback_2",outQ="system:playback_1",
+  def __init__(self,fftn=1024,freq=2350.0,amp=1.0,rtframes=None,
+    inI="system:capture_2",inQ="system:capture_1",
+    outI="system:playback_2",outQ="system:playback_1",
     printlevel=1):
     """Create a VNA object"""
     
@@ -115,22 +104,30 @@ class VNA:
     #self.fftwindow = None
       
     ## Latency settings
-    #jlr = jacklib.jack_latency_range_t()
-    #jacklib.port_get_latency_range(self.oI,jacklib.JackPlaybackLatency,jlr)
-    #self.rtframes = jlr.min
-    #jacklib.port_get_latency_range(self.iI,jacklib.JackCaptureLatency,jlr)
-    #self.rtframes += jlr.min
+    jlr = jacklib.jack_latency_range_t()
+    jacklib.port_get_latency_range(self.oI,jacklib.JackPlaybackLatency,jlr)
+    self.minrtframes = jlr.min
+    jacklib.port_get_latency_range(self.iI,jacklib.JackCaptureLatency,jlr)
+    self.minrtframes += jlr.min
  
     # The above code does not always work
     # Reasonable estimate is 3 times the buffer size
     ## Compute initial array length
     self.buffersz = int(jacklib.get_buffer_size(self.jackclient))
-    self.rtframes = 3 * self.buffersz
-    buffers, remainder = divmod(self.rtframes + self.fftn + 256,self.buffersz)
+    if self.minrtframes < (3*self.buffersz):
+        self.minrtframes = 3 * self.buffersz
+        
+    if rtframes is None:
+        self.rtframes = self.minrtframes
+        ## Loose fit if estimating based on minrtframes
+        buffers, remainder = divmod((2*self.rtframes) + self.fftn + 192,self.buffersz)
+    else:
+        self.rtframes = rtframes
+        ## Tight fit if rtframes is defined
+        buffers, remainder = divmod(self.rtframes + self.fftn + 192,self.buffersz)
+  
     if remainder > 0: buffers = buffers + 1
-
     self.synci = self.rtframes
-     
     self.InitJackArrays(self.freq,buffers*self.buffersz)
     
     self.fftia = pyfftw.n_byte_align_empty(self.fftn, 16, 'complex128')
@@ -168,25 +165,48 @@ class VNA:
     #self.oIa[sf:ef] = scipy.cos(samples) - (scipy.sin(samples)*(1+self.oalpha)*scipy.sin(self.ophi))
     #self.oQa[sf:ef] = scipy.sin(samples)*(1+self.oalpha)*scipy.cos(self.ophi)    
     
-  def TrimArrays(self):
-    """Trim Jack Arrays"""
-    ## Use last sync index
-    if self.synci == self.rtframes:
-      raise IndexError("Sync Index appears uninitialized")
-      
-    samples = self.synci + self.fftn + 20
-    buffers, remainder = divmod(self.synci + self.fftn + 20,self.buffersz)
+  def ResizeArrays(self,rtframes=None):
+    """Resize Jack Arrays"""
+    ## Estimate new rtframes if None
+    if rtframes is None:
+      ## Use last sync index
+      if self.synci == self.rtframes:
+        raise IndexError("Sync index appears uninitialized")
+      else:
+        rtframes = self.synci - 110
+        print "RTFrames computed from last Sync index",rtframes
+    
+    ## Tight fit
+    buffers, remainder = divmod(rtframes + self.fftn + 192,self.buffersz)
     if remainder > 0: buffers = buffers + 1
     
+    
     print "Array length was",self.iIa.size,
-    self.InitJackArrays(self.freq,buffers*self.buffersz)
+    if buffers*self.buffersz != self.iIa.size:
+      self.InitJackArrays(self.freq,buffers*self.buffersz)
     print "now",self.iIa.size
     
+    print "RTFrames was",self.rtframes,"now",rtframes
+    self.rtframes = rtframes
+    
+  def CalibrateArrays(self):
+    """Calibrate Array Lengths Assuming Good Audio Levels"""
+    i = 5
+    while i > 0:
+      try:
+        self.Test()
+        self.ResizeArrays()
+        i = 0
+      except:
+        self.ResizeArrays(2*self.rtframes)
+        i -= 1
+
   def NewAmp(self,amp):
     """Regenerate Test Tone with New Amplitude"""
     print "Amplitude was",self.amp,"now",amp
-    self.amp = amp
-    self.InitJackArrays(self.freq,self.iIa.size)
+    if self.amp != amp:
+      self.amp = amp
+      self.InitJackArrays(self.freq,self.iIa.size)
 
   def Info(self):
     """Print Information"""
@@ -223,7 +243,7 @@ class VNA:
         print "No permission to access the SoftRock USB interface"
         self.usb_dev = None
 
-  def GetStartupFreq(self):	# return the startup frequency / 4
+  def GetStartupFreq(self): # return the startup frequency / 4
     """Return the SoftRock Startup Frequency"""
     if not self.usb_dev: return 0
     ret = self.usb_dev.ctrl_transfer(IN, 0x3C, 0, 0, 4)
@@ -232,7 +252,7 @@ class VNA:
     freq = int(freq * 1.0e6 / 2097152.0 / 4.0 + 0.5)
     return freq
     
-  def GetFreq(self):	# return the running frequency / 4
+  def GetFreq(self):    # return the running frequency / 4
     """Return the SoftRock Running Frequency"""
     if not self.usb_dev: return 0
     ret = self.usb_dev.ctrl_transfer(IN, 0x3A, 0, 0, 4)
@@ -274,9 +294,9 @@ class VNA:
   def Sync(self):
     """Locate the Sync Phase Shift"""
     ## Find start by amplitude
-    mv = 0.7 * self.iIa[self.rtframes:].max()
-    sia = numpy.nonzero( self.iIa[self.rtframes:] > mv )[0]
-    si = sia[0] + self.rtframes
+    mv = 0.7 * self.iIa[self.minrtframes:].max()
+    sia = numpy.nonzero( self.iIa[self.minrtframes:] > mv )[0]
+    si = sia[0] + self.minrtframes
     
     ## Phase change is after 100 frames, add a bit of a buffer
     synca = self.iIa[si:si+120] - 1j * self.iQa[si:si+120]    
@@ -284,12 +304,15 @@ class VNA:
     deltaaa = (anglea[1:] - anglea[:-1]) % 360
     
     ## Buffer FFT start window to 20 frames past phase change
-    syncindex = (numpy.nonzero( (deltaaa > 90) & (deltaaa < 270) )[0][0]) + si + 20 
-    
+    try:
+        syncindex = (numpy.nonzero( (deltaaa > 90) & (deltaaa < 270) )[0][0]) + si + 20 
+    except:
+        raise IndexError("Jack arrays are not long enough and/or bad sync. Resize arrays.")
+        
     self.synci = syncindex
     
     if self.iIa.size < (self.synci + self.fftn):
-      raise IndexError("Jack buffer is not long enough and/or bad sync")
+      raise IndexError("Jack arrays are not long enough and/or bad sync. Resize arrays.")
     
     
   def DoFFT(self):
@@ -470,10 +493,10 @@ class VNA:
 if __name__ == '__main__':
     
   def PrintUsage():
-    print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude> -i <inI> -q <inQ> -I <outI> -Q <outQ>'
+    print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude> -r <roundtripframes> -i <inI> -q <inQ> -I <outI> -Q <outQ>'
    
   try:
-    opts, args = getopt.getopt(sys.argv[1:],"hn:f:a:i:q:I:Q:",[])
+    opts, args = getopt.getopt(sys.argv[1:],"hn:f:a:r:i:q:I:Q:",[])
   except getopt.GetoptError:
     PrintUsage()
     os._exit(2)
@@ -488,6 +511,8 @@ if __name__ == '__main__':
       freq = float(arg)
     elif opt == '-a':
       amp = float(arg)
+    elif opt == '-r':
+      rtframes = int(arg)      
     elif opt == '-i':
       inI = arg
     elif opt == '-q':
@@ -498,7 +523,7 @@ if __name__ == '__main__':
       outQ = arg
   
   RedirectStderr()
-  vna = VNA(fftn,freq,amp,inI,inQ,outI,outQ)
+  vna = VNA(fftn,freq,amp,rtframes,inI,inQ,outI,outQ)
   vna.OpenSoftRock()
   vna.Info()
   
