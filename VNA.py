@@ -173,7 +173,7 @@ class VNA:
       if self.synci == self.rtframes:
         raise IndexError("Sync index appears uninitialized")
       else:
-        rtframes = self.synci - 110
+        rtframes = self.synci - 120
         print "RTFrames computed from last Sync index",rtframes
     
     ## Tight fit
@@ -439,11 +439,17 @@ class VNA:
     ## 180 phase shift as complex portion is created with -1j
     sp.plot(xaxis,-1*self.iQa,'.-',color='r',label='iQ')
     sp.plot(xaxis,self.oIa,'.-',color='c',label='oI')
-    sp.plot(xaxis,self.oQa,'.-',color='m',label='oQ')    
+    sp.plot(xaxis,self.oQa,'.-',color='m',label='oQ') 
+    ## Identify RTFrames
+    maxy = self.oIa.max()
+    sp.plot([self.rtframes,self.rtframes],[-maxy,maxy],'k-',lw=3,label='RT Frames')
+    ## Identify Sync Index
+    sp.plot([self.synci,self.synci],[-maxy,maxy],'g-',lw=3,label='FFT Start')
+    sp.plot([self.synci+self.fftn,self.synci+self.fftn],[-maxy,maxy],'y-',lw=3,label='FFT End')      
     sp.set_ylabel("Magnitude")
     sp.set_xlabel("Sample")
     #sp.legend(bbox_to_anchor=(1,-0.1))  
-    sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=4)   
+    sp.legend(loc=2,bbox_to_anchor=(0,-0.1),ncol=7)   
     plt.show()        
     
  
