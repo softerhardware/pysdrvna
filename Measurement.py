@@ -12,14 +12,24 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License at <http://www.gnu.org/licenses/> for details.
 
-
+from __future__ import print_function
 import numpy as np
-import cPickle as pickle
+import pickle, getopt, sys, os
 import matplotlib as mpl
+mpl.use('Qt4Agg',warn=False)
 import matplotlib.pyplot as plt
+import config
+
+
+try:
+  import smithplot
+except:
+  print("No pySmithChart available")
+  
 
 
 def LoadMeasurement(fn):
+    '''Load a Saved Measurement Object'''
     pf = open(fn+".vam", 'rb')
     m = pickle.load(pf)
     pf.close()
@@ -28,7 +38,7 @@ def LoadMeasurement(fn):
 
 class Measurement:
   
-  def __init__(self,fstart,fstop=None,fstep=0.1,eloadz=60+0j,feedlinez=50+0j,view=False):
+  def __init__(self,fstart,fstop=None,fstep=0.1,eloadz=config.eloadz,feedlinez=config.feedlinez,view=False):
     """Create a Measurement Object"""
 
     ## Do not init anything if creating a view
@@ -176,15 +186,15 @@ class Measurement:
   def Print(self):
     strs = self.Strs(True,True,True,True,True,True,True,True,True)
     for s in strs:
-      for i in s: print i,
-      print
+      for i in s: print(i,)
+      print()
       
   def PrintSWR(self):
     """Print SWR"""
     strs = self.Strs(SWR=True)
     for s in strs:
-      for i in s: print i,
-      print
+      for i in s: print(i,)
+      print()
       
       
   def PlotRho(self):
@@ -357,6 +367,43 @@ class Measurement:
     pkl_file = open(fn+".vam", 'wb')    
     pickle.dump( self, pkl_file )
     pkl_file.close()
+
+
+
+  def PlotSmithChart(self):
+    """Plot a Smith Chart of DUT Z"""
+    # plot data
+    plt.figure(figsize=(8, 8))
+
+    ax = plt.subplot(1, 1, 1, projection='smith', axes_scale=np.abs(self.feedlinez[0]))
+
+    plt.plot(self.Z(), path_interpolation=0, label="DUT")
+
+    plt.legend(loc="lower right")
+    plt.title("DUT Z Smith Chart")
+
+    plt.show()
+    
+    
+if __name__ == '__main__':
+    
+  def PrintUsage():
+    print('python -i Measurement.py -f <filename>')
+    
+  try:
+    opts, args = getopt.getopt(sys.argv[1:],"hf:",[])
+  except getopt.GetoptError:
+    PrintUsage()
+    os._exit(2)
+
+  for opt, arg in opts:
+    if opt == '-h':
+      PrintUsage()
+      os._exit(0)
+    elif opt == '-f':
+      m = LoadMeasurement(arg)
+      
+    
 
 
 

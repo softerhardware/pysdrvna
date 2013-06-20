@@ -1,5 +1,3 @@
-#!/usr/bin/python -i
-
 # PySDRVNA Toolkit is a Python toolkit to use your Software Defined Radio
 # as a simple Vector Network Analyzer. 
 # Copyright (c) 2013 by Steve Haynal, KF7O.
@@ -13,14 +11,19 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License at <http://www.gnu.org/licenses/> for details.
 
-import scipy, struct, usb.core, usb.util, traceback, pyfftw, numpy, time
+from __future__ import print_function
+import struct, usb.core, usb.util, traceback, pyfftw, time
+import numpy as np
+import scipy as sp
 import jacklib, ctypes, threading, getopt, sys, os
-import cPickle as pickle
+import pickle
 import matplotlib as mpl
+## Use Qt4Agg, TkAgg or WXAgg as others cause xruns
+mpl.use('Qt4Agg',warn=False)
 import matplotlib.pyplot as plt
 
 from Measurement import *
-from config import *
+import config
 
 #####
 ## All si570 interface code is borrow directly from or based on QUISK. Thank you!
@@ -49,13 +52,12 @@ def RedirectStderr():
 
 
 class VNA:
-  def __init__(self,fftn=1024,freq=2350.0,amp=1.0,rtframes=None,
-    inI="system:capture_2",inQ="system:capture_1",
-    outI="system:playback_2",outQ="system:playback_1",
-    printlevel=1):
+  def __init__(self,fftn=config.fftn,freq=config.freq,amp=config.amp,rtframes=config.rtframes,
+    inI=config.inI,inQ=config.inQ,outI=config.outI,outQ=config.outQ,printlevel=1):
     """Create a VNA object"""
     
     self.printlevel = printlevel
+    
     self.amp = amp
    
     self.docapture = threading.Event()
@@ -68,7 +70,7 @@ class VNA:
     try:
       self.jackclient.contents
     except:
-      print "Problems with Jack"
+      print("Problems with Jack")
       raise
 
     self.iI = jacklib.port_register(self.jackclient,"iI", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsInput, 0)
@@ -89,18 +91,19 @@ class VNA:
     
     self.Sr = float(jacklib.get_sample_rate(self.jackclient))
     self.dt = 1.0/self.Sr
-        
+    
     self.fftn = fftn
+      
     ## Align frequency to nearest bin
     self.fftbin = int(round((freq/self.Sr)*self.fftn))      
     self.freq = (float(self.fftbin)/self.fftn) * self.Sr
     
     ## Windowing function
-    #self.fftwindow = numpy.blackman(self.fftn)
-    self.fftwindow = numpy.hanning(self.fftn)
-    #self.fftwindow = numpy.kaiser(self.fftn,14)
-    #self.fftwindow = numpy.hamming(self.fftn)
-    #self.fftwindow = numpy.bartlett(self.fftn)
+    #self.fftwindow = np.blackman(self.fftn)
+    self.fftwindow = np.hanning(self.fftn)
+    #self.fftwindow = np.kaiser(self.fftn,14)
+    #self.fftwindow = np.hamming(self.fftn)
+    #self.fftwindow = np.bartlett(self.fftn)
     #self.fftwindow = None
       
     ## Latency settings
@@ -135,35 +138,38 @@ class VNA:
     ## Create FFT Plan
     self.fft = pyfftw.FFTW(self.fftia,self.fftoa)
 
+    self.OpenSoftRock()
+    self.Info()
+
   def InitJackArrays(self,freq,samples):
     """Initialize Jack Arrays"""
-    self.iIa = scipy.zeros(samples).astype(scipy.float32)
-    self.iQa = scipy.zeros(samples).astype(scipy.float32)      
+    self.iIa = sp.zeros(samples).astype(sp.float32)
+    self.iQa = sp.zeros(samples).astype(sp.float32)      
     
-    self.oIa = scipy.zeros(samples, dtype=scipy.float32 )
-    self.oQa = scipy.zeros(samples, dtype=scipy.float32 )
+    self.oIa = sp.zeros(samples, dtype=sp.float32 )
+    self.oQa = sp.zeros(samples, dtype=sp.float32 )
     
     ## 100 frames warmup
     sf = 0
     ef = 100
-    samples = scipy.pi + (2*scipy.pi*freq*(self.dt * scipy.r_[sf:ef]))
-    self.oIa[sf:ef] = self.amp * scipy.cos(samples)
-    self.oQa[sf:ef] = self.amp * scipy.sin(samples)
+    samples = sp.pi + (2*sp.pi*freq*(self.dt * sp.r_[sf:ef]))
+    self.oIa[sf:ef] = self.amp * sp.cos(samples)
+    self.oQa[sf:ef] = self.amp * sp.sin(samples)
     
     # For IQ balancing
-    #self.oIa[sf:ef] = scipy.cos(samples) - (scipy.sin(samples)*(1+self.oalpha)*scipy.sin(self.ophi))
-    #self.oQa[sf:ef] = scipy.sin(samples)*(1+self.oalpha)*scipy.cos(self.ophi)
+    #self.oIa[sf:ef] = sp.cos(samples) - (sp.sin(samples)*(1+self.oalpha)*sp.sin(self.ophi))
+    #self.oQa[sf:ef] = sp.sin(samples)*(1+self.oalpha)*sp.cos(self.ophi)
     
     ## 180 phase change then fftn+50 frames
     sf = ef
     ef = ef + self.fftn + 50
-    samples = (2*scipy.pi*freq*(self.dt * scipy.r_[sf:ef]))
-    self.oIa[sf:ef] = self.amp * scipy.cos(samples) 
-    self.oQa[sf:ef] = self.amp * scipy.sin(samples)   
+    samples = (2*sp.pi*freq*(self.dt * sp.r_[sf:ef]))
+    self.oIa[sf:ef] = self.amp * sp.cos(samples) 
+    self.oQa[sf:ef] = self.amp * sp.sin(samples)   
     
     # For IQ balancing
-    #self.oIa[sf:ef] = scipy.cos(samples) - (scipy.sin(samples)*(1+self.oalpha)*scipy.sin(self.ophi))
-    #self.oQa[sf:ef] = scipy.sin(samples)*(1+self.oalpha)*scipy.cos(self.ophi)    
+    #self.oIa[sf:ef] = sp.cos(samples) - (sp.sin(samples)*(1+self.oalpha)*sp.sin(self.ophi))
+    #self.oQa[sf:ef] = sp.sin(samples)*(1+self.oalpha)*sp.cos(self.ophi)    
     
   def ResizeArrays(self,rtframes=None):
     """Resize Jack Arrays"""
@@ -174,19 +180,19 @@ class VNA:
         raise IndexError("Sync index appears uninitialized")
       else:
         rtframes = self.synci - 120
-        print "RTFrames computed from last Sync index",rtframes
+        print("RTFrames computed from last Sync index",rtframes)
     
     ## Tight fit
     buffers, remainder = divmod(rtframes + self.fftn + 192,self.buffersz)
     if remainder > 0: buffers = buffers + 1
     
     
-    print "Array length was",self.iIa.size,
+    print("Array length was",self.iIa.size,end=" ")
     if buffers*self.buffersz != self.iIa.size:
       self.InitJackArrays(self.freq,buffers*self.buffersz)
-    print "now",self.iIa.size
+    print("now",self.iIa.size)
     
-    print "RTFrames was",self.rtframes,"now",rtframes
+    print("RTFrames was",self.rtframes,"now",rtframes)
     self.rtframes = rtframes
     
   def CalibrateArrays(self):
@@ -203,15 +209,15 @@ class VNA:
 
   def NewAmp(self,amp):
     """Regenerate Test Tone with New Amplitude"""
-    print "Amplitude was",self.amp,"now",amp
+    print("Amplitude was",self.amp,"now",amp)
     if self.amp != amp:
       self.amp = amp
       self.InitJackArrays(self.freq,self.iIa.size)
 
   def Info(self):
     """Print Information"""
-    print "FFT Size:",self.fftn,"FFT Bin:",self.fftbin,"Test Freq:",self.freq,
-    print "Array Length:",self.iIa.size,"Sync Index",self.synci   
+    print("FFT Size:",self.fftn,"FFT Bin:",self.fftbin,"Test Freq:",self.freq,"Amp:",self.amp,"RT Frames:",self.rtframes,end=" ")
+    print("Array Length:",self.iIa.size,"Sync Index",self.synci)
     
     
   ## SoftRock Control
@@ -223,7 +229,7 @@ class VNA:
     self.usb_product_id = 0x05dc
     self.usb_dev = usb.core.find(idVendor=0x16c0, idProduct=0x05dc)
     if self.usb_dev is None:
-      print 'USB device not found VendorID 0x%X ProductID 0x%X' % (self.usb_vendor_id, self.usb_product_id)
+      print('USB device not found VendorID 0x%X ProductID 0x%X' % (self.usb_vendor_id, self.usb_product_id))
     else:
       try:
         self.usb_dev.set_configuration()
@@ -232,15 +238,15 @@ class VNA:
           ver = "%d.%d" % (ret[1], ret[0])
         else:
           ver = 'unknown'
-        print 'Capture from SoftRock Firmware %s' % ver
-        print 'Startup freq', self.GetStartupFreq()
-        print 'Run freq', self.GetFreq()
-        print 'Address 0x%X' % self.usb_dev.ctrl_transfer(IN, 0x41, 0, 0, 1)[0]
+        print('Capture from SoftRock Firmware %s' % ver)
+        print('Startup freq', self.GetStartupFreq())
+        print('Run freq', self.GetFreq())
+        print('Address 0x%X' % self.usb_dev.ctrl_transfer(IN, 0x41, 0, 0, 1)[0])
         sm = self.usb_dev.ctrl_transfer(IN, 0x3B, 0, 0, 2)
         sm = UBYTE2.unpack(sm)[0]
-        print 'Smooth tune', sm
+        print('Smooth tune', sm)
       except:
-        print "No permission to access the SoftRock USB interface"
+        print("No permission to access the SoftRock USB interface")
         self.usb_dev = None
 
   def GetStartupFreq(self): # return the startup frequency / 4
@@ -278,7 +284,7 @@ class VNA:
         traceback.print_exc()
     
 
-  def Quit(self):
+  def Exit(self):
     """Exit Cleanly from Interactive VNA"""
     try:
       jacklib.deactivate(self.jackclient)
@@ -288,24 +294,24 @@ class VNA:
       jacklib.client_close(self.jackclient)
     except:
       pass
-    quit()
+    exit()
     
 
   def Sync(self):
     """Locate the Sync Phase Shift"""
     ## Find start by amplitude
     mv = 0.7 * self.iIa[self.minrtframes:].max()
-    sia = numpy.nonzero( self.iIa[self.minrtframes:] > mv )[0]
+    sia = np.nonzero( self.iIa[self.minrtframes:] > mv )[0]
     si = sia[0] + self.minrtframes
     
     ## Phase change is after 100 frames, add a bit of a buffer
     synca = self.iIa[si:si+120] - 1j * self.iQa[si:si+120]    
-    anglea = numpy.angle(synca,deg=True) + 180
+    anglea = np.angle(synca,deg=True) + 180
     deltaaa = (anglea[1:] - anglea[:-1]) % 360
     
     ## Buffer FFT start window to 20 frames past phase change
     try:
-        syncindex = (numpy.nonzero( (deltaaa > 90) & (deltaaa < 270) )[0][0]) + si + 20 
+        syncindex = (np.nonzero( (deltaaa > 90) & (deltaaa < 270) )[0][0]) + si + 20 
     except:
         raise IndexError("Jack arrays are not long enough and/or bad sync. Resize arrays.")
         
@@ -319,9 +325,9 @@ class VNA:
     """Calculate the FFT"""
     ## Remove DC bias
     I = self.iIa[self.synci:self.synci+self.fftn]
-    #I = I - numpy.mean(I)
+    #I = I - np.mean(I)
     Q = self.iQa[self.synci:self.synci+self.fftn]
-    #Q = Q - numpy.mean(Q)
+    #Q = Q - np.mean(Q)
     
     self.fftia[:] = I - 1j * Q
     if self.fftwindow != None: self.fftia[:] = self.fftwindow * self.fftia
@@ -332,7 +338,7 @@ class VNA:
     """Execute a Test Measurement for Specified Iterations"""
     
     for i in range(0,iterations):
-      print i,
+      print(i,end=" ")
       self.M()
       self.Mprint()
       if sleep:
@@ -366,15 +372,15 @@ class VNA:
   def Mprint(self,isdut=False):
     """Print Information for a Measurement"""
     if self.printlevel > 0:
-      print "Sync:%d" % self.synci,
-      print "Freq:%d" % int(round(self.GetFreq()+self.freq)),
+      print("Sync:%d" % self.synci,end=" ")
+      print("Freq:%d" % int(round(self.GetFreq()+self.freq)),end=" ")
       cn = self.fftoa[self.fftbin]
-      print "Real:%3.1f" % cn.real,
-      print "Imag:%3.1f" % cn.imag,
-      print "Mag:%3.1f" % numpy.abs(cn),
-      print "Phase:%3.1f" % numpy.angle(cn,deg=True)
+      print("Real:%3.1f" % cn.real,end=" ")
+      print("Imag:%3.1f" % cn.imag,end=" ")
+      print("Mag:%3.1f" % np.abs(cn),end=" ")
+      print("Phase:%3.1f" % np.angle(cn,deg=True))
       
-      #print "Bins",numpy.abs(self.fftoa[self.fftbin-1]),numpy.abs(self.fftoa[self.fftbin]),numpy.abs(self.fftoa[self.fftbin+1])
+      #print "Bins",np.abs(self.fftoa[self.fftbin-1]),np.abs(self.fftoa[self.fftbin]),np.abs(self.fftoa[self.fftbin+1])
       
   def M(self,freq=None):
     """Main Measurement Method"""
@@ -401,29 +407,29 @@ class VNA:
 
   def MO(self,m):
     """Measure Open Standard"""
-    print "Beginning Open Measurements"
+    print("Beginning Open Measurements")
     self.M2Array(m.freq,m.open)
     
   def MS(self,m):
     """Measure Short Standard"""
-    print "Beginning Short Measurements"
+    print("Beginning Short Measurements")
     self.M2Array(m.freq,m.short)
     
   def ML(self,m):
     """Measure Load Standard"""
-    print "Beginning Load Measurements"
+    print("Beginning Load Measurements")
     self.M2Array(m.freq,m.load)
 
   def MD(self,m):
     """Measure DUT"""
-    print "Beginning DUT Measurements"
+    print("Beginning DUT Measurements")
     self.M2Array(m.freq,m.dut)
     
   def SWR(self,m,iterations=100):
     """Make Iteration Number of SWR Measurements at Current Frequency"""
     if m.freq.size != 1:
       raise IndexError("SWR requires exactly 1 measurement")
-    print "Beginning SWR Measurements"
+    print("Beginning SWR Measurements")
     
     for j in range(0,iterations):
       self.M(int(m.freq[0]*1000000))
@@ -470,17 +476,17 @@ class VNA:
 
   def PlotFD(self,dbfs=True):
     """Plot Frequency Domain for Last Measurement"""
-    freqspectrum = numpy.abs(self.fftoa)
-    freqspectrum = numpy.concatenate( [freqspectrum[self.fftn/2:self.fftn],freqspectrum[0:self.fftn/2]] )
+    freqspectrum = np.abs(self.fftoa)
+    freqspectrum = np.concatenate( [freqspectrum[self.fftn/2:self.fftn],freqspectrum[0:self.fftn/2]] )
     if dbfs:
-      zerodb = 20*numpy.log10(self.fftn/2)
-      freqspectrum = (20*numpy.log10(abs(freqspectrum))) - zerodb
+      zerodb = 20*np.log10(self.fftn/2)
+      freqspectrum = (20*np.log10(abs(freqspectrum))) - zerodb
       
     fig = self.CreateFigure("Frequency Domain")
     sp = fig.add_subplot(111)
     
-    xaxis = numpy.r_[0:self.fftn] * (self.Sr/self.fftn)
-    xaxis = numpy.concatenate( [(xaxis[self.fftn/2:self.fftn] - self.Sr),xaxis[0:self.fftn/2]])
+    xaxis = np.r_[0:self.fftn] * (self.Sr/self.fftn)
+    xaxis = np.concatenate( [(xaxis[self.fftn/2:self.fftn] - self.Sr),xaxis[0:self.fftn/2]])
     sp.plot(xaxis,freqspectrum,'.-',color='b',label='Spectrum')
     sp.set_ylabel("dBFS")
     sp.set_xlabel("Frequency")
@@ -494,12 +500,10 @@ class VNA:
     fig.suptitle(title, fontsize=20)
     return fig    
     
-
-    
 if __name__ == '__main__':
     
   def PrintUsage():
-    print 'VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude> -r <roundtripframes> -i <inI> -q <inQ> -I <outI> -Q <outQ>'
+    print('VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude> -r <roundtripframes> -i <inI> -q <inQ> -I <outI> -Q <outQ>')
    
   try:
     opts, args = getopt.getopt(sys.argv[1:],"hn:f:a:r:i:q:I:Q:",[])
@@ -512,27 +516,27 @@ if __name__ == '__main__':
       PrintUsage()
       os._exit(0)
     elif opt == '-n':
-      fftn = int(arg)
+      config.fftn = int(arg)
     elif opt == '-f':
-      freq = float(arg)
+      config.freq = float(arg)
     elif opt == '-a':
-      amp = float(arg)
+      config.amp = float(arg)
     elif opt == '-r':
-      rtframes = int(arg)      
+      config.rtframes = int(arg)      
     elif opt == '-i':
-      inI = arg
+      config.inI = arg
     elif opt == '-q':
-      inQ = arg    
+      config.inQ = arg    
     elif opt == '-I':
-      outI = arg    
+      config.outI = arg    
     elif opt == '-Q':
-      outQ = arg
+      config.outQ = arg
   
-  RedirectStderr()
-  vna = VNA(fftn,freq,amp,rtframes,inI,inQ,outI,outQ)
-  vna.OpenSoftRock()
-  vna.Info()
-  
-  print "vna is the VNA object. Type help(vna) for more information. Use vna.Quit() to exit cleanly."
+  try:
+    __IPYTHON__
+  except:
+    RedirectStderr()
+  vna = VNA(config.fftn,config.freq,config.amp,config.rtframes,config.inI,config.inQ,config.outI,config.outQ)
+  print("vna is the VNA object. Type help(vna) for more information. Use vna.Exit() to exit cleanly.")
   
 
