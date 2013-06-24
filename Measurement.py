@@ -186,14 +186,14 @@ class Measurement:
   def Print(self):
     strs = self.Strs(True,True,True,True,True,True,True,True,True)
     for s in strs:
-      for i in s: print(i,)
+      for i in s: print(i,end=" ")
       print()
       
   def PrintSWR(self):
     """Print SWR"""
     strs = self.Strs(SWR=True)
     for s in strs:
-      for i in s: print(i,)
+      for i in s: print(i,end=" ")
       print()
       
       

@@ -386,18 +386,32 @@ class VNA:
     """Main Measurement Method"""
     if freq: self.SetFreq(freq-self.freq)
     
-    self.PTT(1) 
+    attempts = 5
+    while attempts > 0:
+      try:
+        self.PTT(1) 
     
-    self.startframe = 0
-    self.docapture.clear()
-    self.docapture.wait()
+        self.startframe = 0
+        self.docapture.clear()
+        self.docapture.wait()
 
-    self.PTT(0)
-    self.Sync()
+        self.PTT(0)
+        self.Sync()
+        attempts = 0
+      except:
+        print("Error during measurement, retrying")
+        attempts = attempts - 1
+      
     self.DoFFT()
     
   def M2Array(self,freq,array):
     """Array of Main Measurements Method"""
+    ## Warm up
+    f = int(freq[0] * 1000000)
+    for j in range(0,5):
+      self.M(f)
+      self.Mprint()
+    
     i = 0
     for f in freq:
       self.M(int(f*1000000))
