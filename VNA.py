@@ -62,6 +62,10 @@ class VNA:
    
     self.docapture = threading.Event()
     self.docapture.set()
+
+    self.xrun = threading.Event()
+    self.xrun.clear()
+
     self.startframe = 0
 
     #self.jackclient = jacklib.client_open("pysdrvna", jacklib.JackNoStartServer | jacklib.JackSessionID, None)
@@ -80,6 +84,7 @@ class VNA:
     self.oQ = jacklib.port_register(self.jackclient,"oQ", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsOutput, 0)
    
     jacklib.set_process_callback(self.jackclient, self.JackProcess, 0)
+    jacklib.set_xrun_callback(self.jackclient, self.JackXrun, 0)
 
     jacklib.activate(self.jackclient)
    
@@ -368,6 +373,12 @@ class VNA:
         self.docapture.set() 
               
     return 0
+
+  def JackXrun(self,arg):
+    """Jack Xrun Callback"""
+    self.xrun.set()
+    return 0
+
     
   def Mprint(self,isdut=False):
     """Print Information for a Measurement"""
@@ -392,12 +403,19 @@ class VNA:
         self.PTT(1) 
     
         self.startframe = 0
+        self.xrun.clear()
         self.docapture.clear()
         self.docapture.wait()
 
         self.PTT(0)
-        self.Sync()
-        attempts = 0
+
+        if self.xrun.is_set():
+          ## An xrun occurred, attempt again
+          print("XRUN during measurement, retrying")
+          attempts = attempts -1
+        else:
+          self.Sync()
+          attempts = 0
       except:
         print("Error during measurement, retrying")
         attempts = attempts - 1
