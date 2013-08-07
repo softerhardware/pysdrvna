@@ -47,6 +47,8 @@ class Measurement:
     if fstop:
       ## Init frequency array
       self.freq = np.arange(fstart,fstop,fstep)
+    elif isinstance(fstart,list):
+      self.freq = np.array( fstart )
     else:
       self.freq = np.array( [fstart] )
     
@@ -130,6 +132,18 @@ class Measurement:
     nms.dut = self.dut[isl]
     
     return nms
+
+  def IndexSlice(self,start,end):
+    isl = slice(start,end)
+    nms = Measurement(0,view=True)
+    nms.freq = self.freq[isl]
+    nms.open = self.open[isl]
+    nms.short = self.short[isl]
+    nms.load = self.load[isl]
+    nms.eloadz = self.eloadz[isl]
+    nms.feedlinez = self.feedlinez[isl]
+    nms.dut = self.dut[isl]  
+    return nms  
     
   def Copy(self):
     """Copy a Measurement Object"""
@@ -142,30 +156,49 @@ class Measurement:
     nms.feedlinez = np.copy(self.feedlinez)
     nms.dut = np.copy(self.dut)
     return nms
+
+  def Freq2TimeSeries(self):
+    """Convert multiple measurements typically at one frequency to timeseries data"""
+    self.freq = np.arange(len(self.freq))
+
+  def ReuseStandardSamples(self):
+
+    for i in range(len(self.freq)):
+      self.open[i] = self.open[0]
+      self.short[i] = self.short[0]
+      self.load[i] = self.load[0]
     
  
   def Z(self):
     """Compute Complex Impedance"""
-    return (self.eloadz * (self.open-self.load) * (self.dut-self.short)) / ((self.load-self.short) * (self.open-self.dut))
-    
-  def Rho(self,z=None):
-    """Compute Reflection Coefficient"""
-    if not z: z = self.Z()
-    return (z - self.feedlinez)/(z + self.feedlinez)
+    if config.ZfromGamma and not config.GammafromZ:
+      G = self.Gamma()
+      return (-self.feedlinez) * ((G+1)/(G-1))
+    else:
+      return (self.eloadz * (self.open-self.load) * (self.dut-self.short)) / ((self.load-self.short) * (self.open-self.dut))
 
-  def SWR(self,rho=None):
+  def Gamma(self):
+    """Compute Reflection Coefficient"""
+    if config.GammafromZ and not config.ZfromGamma:
+      z = self.Z()
+      return (z - self.feedlinez)/(z + self.feedlinez)
+    else:
+      La = (self.eloadz - self.feedlinez) / (self.eloadz + self.feedlinez)
+      t = (self.short - self.dut)*(self.load-self.open) + (self.open-self.dut)*(self.load-self.short)
+      t = t / ((self.dut - self.load) * (self.open-self.short))
+      return ((La*t)+1)/(La + t)
+
+  def SWR(self):
     """Compute SWR"""
-    if not rho: rho = self.Rho()
-    rho = np.abs(rho)
+    rho = np.abs(self.Gamma())
     return (1+rho)/(1-rho)
-    
-  def RL(self,rho=None):
+
+  def RL(self):
     """Compute Return Loss"""
-    if not rho: rho = self.Rho()
-    rho = np.abs(rho)
+    rho = np.abs(self.Gamma())
     return (-20 * np.log10(rho))
     
-  def Strs(self,SWR=False,Z=False,RL=False,Rho=False,Open=False,Short=False,Load=False,ELoad=False,ZLine=False):
+  def Strs(self,SWR=False,Z=False,RL=False,Gamma=False,Open=False,Short=False,Load=False,ELoad=False,ZLine=False):
     ## Always include frequency
     fstrs = ['{:>9.6f} MHz'.format(x) for x in self.freq]
     li = [fstrs]
@@ -173,7 +206,7 @@ class Measurement:
     if SWR: li.append(['SWR:{:>2.2f}'.format(x) for x in self.SWR()])
     if Z: li.append(['Z:({:>+7.2f}{:>+7.2f}j)'.format(x.real,x.imag) for x in self.Z()])
     if RL: li.append(['RL:{:>2.2f}'.format(x) for x in self.RL()])    
-    if Rho: li.append(['Rho:({:>+7.2f}{:>+7.2f}j)'.format(x.real,x.imag) for x in self.Rho()])    
+    if Gamma: li.append(['Gamma:({:>+7.2f}{:>+7.2f}j)'.format(x.real,x.imag) for x in self.Gamma()])    
     if Open: li.append(['Open:({:>+7.2f}{:>+7.2f}j)'.format(x.real,x.imag) for x in self.open])
     if Short: li.append(['Short:({:>+7.2f}{:>+7.2f}j)'.format(x.real,x.imag) for x in self.short])        
     if Load: li.append(['Load:({:>+7.2f}{:>+7.2f}j)'.format(x.real,x.imag) for x in self.load])
@@ -197,17 +230,17 @@ class Measurement:
       print()
       
       
-  def PlotRho(self):
-    """Plot Rho"""
-    fig = self.CreateFigure("Rho vs Frequency")
+  def PlotGamma(self):
+    """Plot Gamma"""
+    fig = self.CreateFigure("Gamma")
     sp = fig.add_subplot(111)
-    self.SubPlotComplex(sp,self.Rho())
+    self.SubPlotComplex(sp,self.Gamma())
     self.SubPlotMHz(sp)
     plt.show()    
     
   def PlotOpen(self):
     """Plot Open Standard"""
-    fig = self.CreateFigure("Open vs Frequency")
+    fig = self.CreateFigure("Open")
     sp = fig.add_subplot(111)
     self.SubPlotComplex(sp,self.open)
     self.SubPlotMHz(sp)
@@ -215,7 +248,7 @@ class Measurement:
     
   def PlotLoad(self):
     """Plot Load Standard"""
-    fig = self.CreateFigure("Load vs Frequency")
+    fig = self.CreateFigure("Load")
     sp = fig.add_subplot(111)
     self.SubPlotComplex(sp,self.load)
     self.SubPlotMHz(sp)
@@ -223,7 +256,7 @@ class Measurement:
 
   def PlotDUT(self):
     """Plot DUT"""
-    fig = self.CreateFigure("DUT vs Frequency")
+    fig = self.CreateFigure("DUT")
     sp = fig.add_subplot(111)
     self.SubPlotComplex(sp,self.dut)
     self.SubPlotMHz(sp)
@@ -232,7 +265,7 @@ class Measurement:
 
   def PlotZ(self,absxc=True):
     """Plot DUT Z vs Frequency"""
-    fig = self.CreateFigure("DUT Z vs Frequency")
+    fig = self.CreateFigure("DUT and Z")
     sp = fig.add_subplot(111)
     self.SubPlotImpedance(sp,self.Z(),absxc)
     self.SubPlotMHz(sp)
@@ -240,7 +273,7 @@ class Measurement:
     
   def PlotELoadZ(self,absxc=True):
     """Plot Expected Load Z vs Frequency"""
-    fig = self.CreateFigure("Expected Load Z vs Frequency")
+    fig = self.CreateFigure("Expected Load Z")
     sp = fig.add_subplot(111)
     self.SubPlotImpedance(sp,self.eloadz,absxc)
     self.SubPlotMHz(sp)
@@ -248,7 +281,7 @@ class Measurement:
     
   def PlotFeedLineZ(self,absxc=True):
     """Plot Feedline Z vs Frequency"""
-    fig = self.CreateFigure("Line Z vs Frequency")
+    fig = self.CreateFigure("Line Z")
     sp = fig.add_subplot(111)
     self.SubPlotImpedance(sp,self.feedlinez,absxc)
     self.SubPlotMHz(sp)
@@ -256,7 +289,7 @@ class Measurement:
     
   def PlotSWR(self):
     """Plot SWR"""
-    fig = self.CreateFigure("SWR vs Frequency")
+    fig = self.CreateFigure("SWR")
     sp = fig.add_subplot(111)
     self.SubPlotSWR(sp)
     self.SubPlotMHz(sp)
@@ -264,20 +297,32 @@ class Measurement:
     
   def PlotRL(self):
     """Plot Return Loss vs Frequency"""
-    fig = self.CreateFigure("Return Loss vs Frequency")
+    fig = self.CreateFigure("Return Loss")
     sp = fig.add_subplot(111)
     self.SubPlotRL(sp)
     self.SubPlotMHz(sp)
     plt.show()
 
   def Plot(self,absxc=True):
-    fig = self.CreateFigure("DUT Z and SWR vs Frequency")
+    fig = self.CreateFigure("DUT Z and SWR")
     sp1 = fig.add_subplot(111)
     self.SubPlotImpedance(sp1,self.Z(),absxc)
     sp2 = sp1.twinx()
     self.SubPlotSWR(sp2)
     self.SubPlotMHz(sp1)
     plt.show()       
+
+  def PlotGammaMagAngle(self):
+    
+    fig = self.CreateFigure("Reflection Coefficient")
+    sp1 = fig.add_subplot(111)
+    G = self.Gamma()
+    self.SubPlotMag(sp1,G,"Magnitude")
+    sp2 = sp1.twinx()
+    self.SubPlotAngle(sp2,G,"Angle")
+    self.SubPlotMHz(sp1)
+    plt.show()       
+
 
   def CreateFigure(self,title):
     fig = plt.figure()
@@ -287,6 +332,7 @@ class Measurement:
  
   def SubPlotMHz(self,sp):
     ## Appropriate xscale
+
     fmin = self.freq[0]
     fmax = self.freq[-1]
     frange = fmax - fmin
@@ -295,7 +341,9 @@ class Measurement:
 
     sp.xaxis.set_major_locator(mpl.ticker.LinearLocator())
     
-    if frange > 1.0:
+    if self.freq[0] == 0:
+      sp.xaxis.set_major_formatter(mpl.ticker.FormatStrFormatter("%.0f"))
+    elif frange > 1.0:
       sp.xaxis.set_major_formatter(mpl.ticker.FormatStrFormatter("%.2f"))
     else:
       sp.xaxis.set_major_formatter(mpl.ticker.FormatStrFormatter("%.3f"))      
@@ -306,7 +354,11 @@ class Measurement:
     sp.xaxis.grid(True)
 
     sp.tick_params(axis='x', pad=10)    
-    sp.set_xlabel("MHz") 
+
+    if self.freq[0] == 0:
+      sp.set_xlabel("Sample")
+    else:
+      sp.set_xlabel("MHz") 
  
  
   def SubPlotImpedance(self,sp,ca,absxc=True):    
@@ -347,7 +399,20 @@ class Measurement:
     
     sp.plot(self.freq,self.RL(),'.-',color='m',label='RL')
     sp.set_ylabel("dB")
-    sp.legend(bbox_to_anchor=(1,-0.1))    
+    sp.legend(bbox_to_anchor=(1,-0.1))   
+
+  def SubPlotMag(self,sp,ca,yaxislabel=""):
+    sp.ticklabel_format(useOffset=False)
+    sp.plot(self.freq,np.abs(ca),'.-',color='b',label='Magnitude')
+    sp.set_ylabel(yaxislabel)
+    sp.legend(loc=2,bbox_to_anchor=(0,-0.1))
+    
+
+  def SubPlotAngle(self,sp,ca,yaxislabel=""):
+    sp.ticklabel_format(useOffset=False)
+    sp.plot(self.freq,np.angle(ca,deg=True),'.-',color='r',label='Angle')
+    sp.set_ylabel(yaxislabel)
+    sp.legend(bbox_to_anchor=(1,-0.1))
  
   def SaveLinSmith(self,fn):
     """Export LinSmith File"""
@@ -388,7 +453,7 @@ class Measurement:
 if __name__ == '__main__':
     
   def PrintUsage():
-    print('python -i Measurement.py -f <filename>')
+    print('python3 -i Measurement.py -f <filename>')
     
   try:
     opts, args = getopt.getopt(sys.argv[1:],"hf:",[])

@@ -12,7 +12,7 @@
 # GNU General Public License at <http://www.gnu.org/licenses/> for details.
 
 from __future__ import print_function
-import struct, usb.core, usb.util, traceback, pyfftw, time
+import struct, usb.core, usb.util, traceback, pyfftw, time, math
 import numpy as np
 import scipy as sp
 import jacklib, ctypes, threading, getopt, sys, os
@@ -35,6 +35,19 @@ import config
 # I2C-address of the SI570;  Thanks to Joachim Schneider, DB6QS
 si570_i2c_address = 0x55
 
+# Thanks to Ethan Blanton, KB8OJH, for this patch for the Si570 (many SoftRocks):
+# These are used by SetFreqByDirect(); see below.
+# The Si570 DCO must be clamped between these values
+SI570_MIN_DCO = 4.85e9
+SI570_MAX_DCO = 5.67e9
+# The Si570 has 6 valid HSDIV values.  Subtract 4 from HSDIV before
+# stuffing it.  We want to find the highest HSDIV first, so start
+# from 11.
+SI570_HSDIV_VALUES = [11, 9, 7, 6, 5, 4]
+
+si570_xtal_freq = 114251870
+
+
 IN =  usb.util.build_request_type(usb.util.CTRL_IN,  usb.util.CTRL_TYPE_VENDOR, usb.util.CTRL_RECIPIENT_DEVICE)
 OUT = usb.util.build_request_type(usb.util.CTRL_OUT, usb.util.CTRL_TYPE_VENDOR, usb.util.CTRL_RECIPIENT_DEVICE)
 
@@ -52,13 +65,16 @@ def RedirectStderr():
 
 
 class VNA:
-  def __init__(self,fftn=config.fftn,freq=config.freq,amp=config.amp,rtframes=config.rtframes,
-    inI=config.inI,inQ=config.inQ,outI=config.outI,outQ=config.outQ,printlevel=1):
+  def __init__(self,configd=None):
     """Create a VNA object"""
-    
-    self.printlevel = printlevel
-    
-    self.amp = amp
+
+    if configd is None: configd = config.__dict__
+
+    self.printlevel = configd['printlevel']
+    self.fftn = configd['fftn']
+    self.amp = configd['amp']
+    self.warmuptime = configd['warmuptime']
+    self.cooldowntime = configd['cooldowntime']
    
     self.docapture = threading.Event()
     self.docapture.set()
@@ -75,7 +91,8 @@ class VNA:
       self.jackclient.contents
     except:
       print("Problems with Jack")
-      raise
+      return
+      #raise
 
     self.iI = jacklib.port_register(self.jackclient,"iI", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsInput, 0)
     self.iQ = jacklib.port_register(self.jackclient,"iQ", jacklib.JACK_DEFAULT_AUDIO_TYPE, jacklib.JackPortIsInput, 0)    
@@ -88,19 +105,17 @@ class VNA:
 
     jacklib.activate(self.jackclient)
    
-    jacklib.connect(self.jackclient,"pysdrvna:oQ", outQ)
-    jacklib.connect(self.jackclient,"pysdrvna:oI", outI)    
+    jacklib.connect(self.jackclient,"pysdrvna:oQ", configd['outQ'])
+    jacklib.connect(self.jackclient,"pysdrvna:oI", configd['outI'])    
     
-    jacklib.connect(self.jackclient,inQ,"pysdrvna:iQ")
-    jacklib.connect(self.jackclient,inI,"pysdrvna:iI") 
+    jacklib.connect(self.jackclient,configd['inQ'],"pysdrvna:iQ")
+    jacklib.connect(self.jackclient,configd['inI'],"pysdrvna:iI") 
     
     self.Sr = float(jacklib.get_sample_rate(self.jackclient))
     self.dt = 1.0/self.Sr
-    
-    self.fftn = fftn
       
     ## Align frequency to nearest bin
-    self.fftbin = int(round((freq/self.Sr)*self.fftn))      
+    self.fftbin = int(round((configd['freq']/self.Sr)*self.fftn))      
     self.freq = (float(self.fftbin)/self.fftn) * self.Sr
     
     ## Windowing function
@@ -124,15 +139,24 @@ class VNA:
     self.buffersz = int(jacklib.get_buffer_size(self.jackclient))
     if self.minrtframes < (3*self.buffersz):
         self.minrtframes = 3 * self.buffersz
-        
-    if rtframes is None:
-        self.rtframes = self.minrtframes
+
+
+    ## rtframes is the round trip audio latency, or when the received audio signal will start    
+    self.rtframes = configd['rtframes'] if configd['rtframes'] else self.minrtframes
+    ## delta from rtframes to phase shift sync in frames
+    self.rtframes2sync = configd['rtframes2sync']
+    ## delta from phase shift sync to fft start in frames
+    self.sync2fft = configd['sync2fft']
+    ## delta from end of fft to end of audio
+    self.fft2end = configd['fft2end']
+
+
+    if configd['rtframes'] is None:
         ## Loose fit if estimating based on minrtframes
-        buffers, remainder = divmod((2*self.rtframes) + self.fftn + 192,self.buffersz)
+        buffers, remainder = divmod((2*self.rtframes) + self.rtframes2sync + self.sync2fft + self.fftn + self.fft2end,self.buffersz)
     else:
-        self.rtframes = rtframes
         ## Tight fit if rtframes is defined
-        buffers, remainder = divmod(self.rtframes + self.fftn + 192,self.buffersz)
+        buffers, remainder = divmod(self.rtframes + self.rtframes2sync + self.sync2fft + self.fftn + self.fft2end,self.buffersz)
   
     if remainder > 0: buffers = buffers + 1
     self.synci = self.rtframes
@@ -156,7 +180,7 @@ class VNA:
     
     ## 100 frames warmup
     sf = 0
-    ef = 100
+    ef = self.rtframes2sync
     samples = sp.pi + (2*sp.pi*freq*(self.dt * sp.r_[sf:ef]))
     self.oIa[sf:ef] = self.amp * sp.cos(samples)
     self.oQa[sf:ef] = self.amp * sp.sin(samples)
@@ -165,9 +189,9 @@ class VNA:
     #self.oIa[sf:ef] = sp.cos(samples) - (sp.sin(samples)*(1+self.oalpha)*sp.sin(self.ophi))
     #self.oQa[sf:ef] = sp.sin(samples)*(1+self.oalpha)*sp.cos(self.ophi)
     
-    ## 180 phase change then fftn+50 frames
+    ## 180 phase change 
     sf = ef
-    ef = ef + self.fftn + 50
+    ef = ef + self.sync2fft + self.fftn + self.fft2end
     samples = (2*sp.pi*freq*(self.dt * sp.r_[sf:ef]))
     self.oIa[sf:ef] = self.amp * sp.cos(samples) 
     self.oQa[sf:ef] = self.amp * sp.sin(samples)   
@@ -184,11 +208,11 @@ class VNA:
       if self.synci == self.rtframes:
         raise IndexError("Sync index appears uninitialized")
       else:
-        rtframes = self.synci - 120
+        rtframes = self.synci - self.rtframes2sync
         print("RTFrames computed from last Sync index",rtframes)
     
     ## Tight fit
-    buffers, remainder = divmod(rtframes + self.fftn + 192,self.buffersz)
+    buffers, remainder = divmod(rtframes + self.rtframes2sync + self.sync2fft + self.fftn + self.fft2end,self.buffersz)
     if remainder > 0: buffers = buffers + 1
     
     
@@ -222,7 +246,7 @@ class VNA:
   def Info(self):
     """Print Information"""
     print("FFT Size:",self.fftn,"FFT Bin:",self.fftbin,"Test Freq:",self.freq,"Amp:",self.amp,"RT Frames:",self.rtframes,end=" ")
-    print("Array Length:",self.iIa.size,"Sync Index",self.synci)
+    print("RT2Sync:",self.rtframes2sync,"Sync2FFT:",self.sync2fft,"FFT2End:",self.fft2end,"Array Length:",self.iIa.size,"Sync Index:",self.synci)
     
     
   ## SoftRock Control
@@ -281,6 +305,55 @@ class VNA:
     except usb.core.USBError:
       traceback.print_exc()
     
+  def SetFreqNew(self, freq): # Thanks to Ethan Blanton, KB8OJH
+    if freq == 0.0:
+      return False
+    # For now, find the minimum DCO speed that will give us the
+    # desired frequency; if we're slewing in the future, we want this
+    # to additionally yield an RFREQ ~= 512.
+    freq = int(freq * 4)
+    dco_new = None
+    hsdiv_new = 0
+    n1_new = 0
+    for hsdiv in SI570_HSDIV_VALUES:
+      n1 = int(math.ceil(SI570_MIN_DCO / (freq * hsdiv)))
+      if n1 < 1:
+        n1 = 1
+      else:
+        n1 = ((n1 + 1) / 2) * 2
+      dco = (freq * 1.0) * hsdiv * n1
+      # Since we're starting with max hsdiv, this can only happen if
+      # freq was larger than we can handle
+      if n1 > 128:
+        continue
+      if dco < SI570_MIN_DCO or dco > SI570_MAX_DCO:
+        # This really shouldn't happen
+        continue
+      if not dco_new or dco < dco_new:
+        dco_new = dco
+        hsdiv_new = hsdiv
+        n1_new = n1
+    if not dco_new:
+      # For some reason, we were unable to calculate a frequency.
+      # Probably because the frequency requested is outside the range
+      # of our device.
+      return False    # Failure
+    rfreq = dco_new / si570_xtal_freq
+    rfreq_int = int(rfreq)
+    rfreq_frac = int(round((rfreq - rfreq_int) * 2**28))
+    # It looks like the DG8SAQ protocol just passes r7-r12 straight
+    # To the Si570 when given command 0x30.  Easy enough.
+    # n1 is stuffed as n1 - 1, hsdiv is stuffed as hsdiv - 4.
+    hsdiv_new = hsdiv_new - 4
+    n1_new = int(n1_new - 1)
+    print(hsdiv_new,n1_new,rfreq_int,rfreq_frac)
+    s = struct.Struct('>BBL').pack((hsdiv_new << 5) + (n1_new >> 2),
+                                   ((n1_new & 0x3) << 6) + (rfreq_int >> 4),
+                                   ((rfreq_int & 0xf) << 28) + rfreq_frac)
+    self.usb_dev.ctrl_transfer(OUT, 0x30, si570_i2c_address + 0x700, 0, s)
+    return True   # Success
+
+
   def PTT(self, ptt):
     if self.usb_dev:
       try:
@@ -309,45 +382,58 @@ class VNA:
     sia = np.nonzero( self.iIa[self.minrtframes:] > mv )[0]
     si = sia[0] + self.minrtframes
     
-    ## Phase change is after 100 frames, add a bit of a buffer
-    synca = self.iIa[si:si+120] - 1j * self.iQa[si:si+120]    
+    ## Phase change
+    synca = self.iIa[si:si+(2*self.rtframes2sync)] - 1j * self.iQa[si:si+(2*self.rtframes2sync)]    
     anglea = np.angle(synca,deg=True) + 180
     deltaaa = (anglea[1:] - anglea[:-1]) % 360
     
-    ## Buffer FFT start window to 20 frames past phase change
+    ## Find sync index
     try:
-        syncindex = (np.nonzero( (deltaaa > 90) & (deltaaa < 270) )[0][0]) + si + 20 
+        syncindex = (np.nonzero( (deltaaa > 90) & (deltaaa < 270) )[0][0]) + si 
     except:
         raise IndexError("Jack arrays are not long enough and/or bad sync. Resize arrays.")
         
     self.synci = syncindex
     
-    if self.iIa.size < (self.synci + self.fftn):
+    if self.iIa.size < (self.synci + self.sync2fft + self.fftn):
       raise IndexError("Jack arrays are not long enough and/or bad sync. Resize arrays.")
     
     
   def DoFFT(self):
     """Calculate the FFT"""
+    I = self.iIa[self.synci+self.sync2fft:self.synci+self.sync2fft+self.fftn]
+    Q = self.iQa[self.synci+self.sync2fft:self.synci+self.sync2fft+self.fftn]
+
     ## Remove DC bias
-    I = self.iIa[self.synci:self.synci+self.fftn]
-    #I = I - np.mean(I)
-    Q = self.iQa[self.synci:self.synci+self.fftn]
     #Q = Q - np.mean(Q)
+    #I = I - np.mean(I)
     
     self.fftia[:] = I - 1j * Q
     if self.fftwindow != None: self.fftia[:] = self.fftwindow * self.fftia
     
     self.fft()
 
-  def Test(self,iterations=1,sleep=None):
+  def DoCoolDown(self):
+    if self.cooldowntime:
+      time.sleep(self.cooldowntime)
+
+  def DoWarmUp(self):
+    if self.warmuptime:
+      self.PTT(1)
+      time.sleep(self.warmuptime)
+      self.PTT(0)
+      self.DoCoolDown()
+
+  def Test(self,iterations=1):
     """Execute a Test Measurement for Specified Iterations"""
-    
+    self.DoWarmUp()
+
     for i in range(0,iterations):
       print(i,end=" ")
       self.M()
       self.Mprint()
-      if sleep:
-        time.sleep(sleep)      
+
+      self.DoCoolDown()
 
   
   def JackProcess(self,nframes,arg):
@@ -386,28 +472,33 @@ class VNA:
       print("Sync:%d" % self.synci,end=" ")
       print("Freq:%d" % int(round(self.GetFreq()+self.freq)),end=" ")
       cn = self.fftoa[self.fftbin]
-      print("Real:%3.1f" % cn.real,end=" ")
-      print("Imag:%3.1f" % cn.imag,end=" ")
-      print("Mag:%3.1f" % np.abs(cn),end=" ")
-      print("Phase:%3.1f" % np.angle(cn,deg=True))
+      print("Real:%3.2f" % cn.real,end=" ")
+      print("Imag:%3.2f" % cn.imag,end=" ")
+      print("Mag:%3.2f" % np.abs(cn),end=" ")
+      print("Phase:%3.2f" % np.angle(cn,deg=True))
       
       #print "Bins",np.abs(self.fftoa[self.fftbin-1]),np.abs(self.fftoa[self.fftbin]),np.abs(self.fftoa[self.fftbin+1])
       
-  def M(self,freq=None):
+  def M(self,freq=None,ptt=True,warmup=False):
     """Main Measurement Method"""
-    if freq: self.SetFreq(freq-self.freq)
+    if freq: 
+      #time.sleep(0.2)
+      self.SetFreq(freq-self.freq)
+      time.sleep(0.005)
+
+    if warmup: self.DoWarmUp()
     
     attempts = 5
     while attempts > 0:
       try:
-        self.PTT(1) 
+        if ptt: self.PTT(1) 
     
         self.startframe = 0
         self.xrun.clear()
         self.docapture.clear()
         self.docapture.wait()
 
-        self.PTT(0)
+        if ptt: self.PTT(0)
 
         if self.xrun.is_set():
           ## An xrun occurred, attempt again
@@ -424,18 +515,20 @@ class VNA:
     
   def M2Array(self,freq,array):
     """Array of Main Measurements Method"""
-    ## Warm up
-    f = int(freq[0] * 1000000)
-    for j in range(0,5):
-      self.M(f)
-      self.Mprint()
+    try:
+
+      self.DoWarmUp()
     
-    i = 0
-    for f in freq:
-      self.M(int(f*1000000))
-      array[i] = self.fftoa[self.fftbin]
-      self.Mprint()
-      i += 1    
+      i = 0
+      for f in freq:
+        self.M(int(f*1000000))
+        array[i] = self.fftoa[self.fftbin]
+        self.Mprint()
+        i += 1
+        self.DoCoolDown()
+    except:
+      print("Error during array measurement")
+    self.PTT(0)    
 
   def MO(self,m):
     """Measure Open Standard"""
@@ -462,11 +555,14 @@ class VNA:
     if m.freq.size != 1:
       raise IndexError("SWR requires exactly 1 measurement")
     print("Beginning SWR Measurements")
-    
+
+    self.DoWarmUp()
+
     for j in range(0,iterations):
       self.M(int(m.freq[0]*1000000))
       m.dut[0] = self.fftoa[self.fftbin]
       m.PrintSWR()
+      self.DoCoolDown()
  
   def PlotTD(self):
     """Plot Time Domain of Jack Input and Output Arrays for Last Measurement"""
@@ -482,8 +578,8 @@ class VNA:
     maxy = self.oIa.max()
     sp.plot([self.rtframes,self.rtframes],[-maxy,maxy],'k-',lw=3,label='RT Frames')
     ## Identify Sync Index
-    sp.plot([self.synci,self.synci],[-maxy,maxy],'g-',lw=3,label='FFT Start')
-    sp.plot([self.synci+self.fftn,self.synci+self.fftn],[-maxy,maxy],'y-',lw=3,label='FFT End')      
+    sp.plot([self.synci+self.sync2fft,self.synci+self.sync2fft],[-maxy,maxy],'g-',lw=3,label='FFT Start')
+    sp.plot([self.synci+self.sync2fft+self.fftn,self.synci+self.sync2fft+self.fftn],[-maxy,maxy],'y-',lw=3,label='FFT End')      
     sp.set_ylabel("Magnitude")
     sp.set_xlabel("Sample")
     #sp.legend(bbox_to_anchor=(1,-0.1))  
@@ -531,44 +627,46 @@ class VNA:
     fig.subplots_adjust(bottom=0.2)
     fig.suptitle(title, fontsize=20)
     return fig    
-    
-if __name__ == '__main__':
-    
-  def PrintUsage():
-    print('VNA.py -n <fftn> -f <testtonefreq> -a <testtoneamplitude> -r <roundtripframes> -i <inI> -q <inQ> -I <outI> -Q <outQ>')
-   
-  try:
-    opts, args = getopt.getopt(sys.argv[1:],"hn:f:a:r:i:q:I:Q:",[])
-  except getopt.GetoptError:
-    PrintUsage()
-    os._exit(2)
 
-  for opt, arg in opts:
-    if opt == '-h':
-      PrintUsage()
-      os._exit(0)
-    elif opt == '-n':
-      config.fftn = int(arg)
-    elif opt == '-f':
-      config.freq = float(arg)
-    elif opt == '-a':
-      config.amp = float(arg)
-    elif opt == '-r':
-      config.rtframes = int(arg)      
-    elif opt == '-i':
-      config.inI = arg
-    elif opt == '-q':
-      config.inQ = arg    
-    elif opt == '-I':
-      config.outI = arg    
-    elif opt == '-Q':
-      config.outQ = arg
-  
+
+  def UncorrectedReflectionCoefficientAccuracyTest(self,repititions=200,freq=None):
+    '''Measure accuracy of uncorrect reflection coefficient for large number of repititions'''
+    if freq:
+      self.SetFreq(freq)
+      time.sleep(0.005)   
+
+    ## Create NP array with proper dimensions
+    a = np.zeros( repititions, dtype=np.complex )
+
+    self.DoWarmUp()
+
+    for i in range(repititions):
+      self.M()
+      cn = self.fftoa[self.fftbin]
+      a[i] = cn
+
+      self.DoCoolDown()
+     
+    pa = np.angle(a)
+    magstd = np.std(a)
+    angstd = np.std(pa)
+    mean = np.mean(a)
+    nmagstd = magstd / np.abs(mean)
+    print ("STD Deviation of magnitude (percent) and angle:",nmagstd,angstd)
+    print ("Mean:",mean,"Range:",np.max(a)-np.min(a))
+
+    return a
+
+
+
+if __name__ == '__main__':
+
   try:
     __IPYTHON__
   except:
     RedirectStderr()
-  vna = VNA(config.fftn,config.freq,config.amp,config.rtframes,config.inI,config.inQ,config.outI,config.outQ)
-  print("vna is the VNA object. Type help(vna) for more information. Use vna.Exit() to exit cleanly.")
+  vna = VNA(config.__dict__)
+  print('Usage: python3 VNA.py')
+  print("vna is the VNA object. Type help(vna) for more information.")
+  print("Use vna.Exit() to exit cleanly. Edit config.py for options.")
   
-
