@@ -315,6 +315,7 @@ class Measurement:
   def PlotGammaMagAngle(self):
     
     fig = self.CreateFigure("Reflection Coefficient")
+    fig.subplots_adjust(right=0.86)
     sp1 = fig.add_subplot(111)
     G = self.Gamma()
     self.SubPlotMag(sp1,G,"Magnitude")
